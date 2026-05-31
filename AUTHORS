@@ -1,0 +1,17 @@
+Zenbite contributors
+====================
+
+Project lead and primary maintainer
+-----------------------------------
+
+* Oliver Petz <oliverpetz805@gmail.com>  (GitHub: @olivenda)
+
+Contributors
+------------
+
+Zenbite is built by everyone who has sent a patch. Add yourself in your first PR
+(any format: name, GitHub handle, or both).
+
+The canonical record of contributions is the git log:
+
+    git shortlog -sne
