@@ -15,6 +15,7 @@ global stage1_blob, stage1_blob_size
 global stage2_blob, stage2_blob_size
 global stage1_hdd_blob, stage1_hdd_blob_size
 global stage2_hdd_blob, stage2_hdd_blob_size
+global mbr_blob, mbr_blob_size
 
 stage1_blob:
             incbin "build/boot/stage1.bin"
@@ -35,3 +36,8 @@ stage2_hdd_blob:
             incbin "build/boot/stage2_hdd.bin"
 stage2_hdd_blob_end:
 stage2_hdd_blob_size:   dd stage2_hdd_blob_end - stage2_hdd_blob
+
+mbr_blob:
+            incbin "build/boot/mbr.bin"
+mbr_blob_end:
+mbr_blob_size:          dd mbr_blob_end - mbr_blob

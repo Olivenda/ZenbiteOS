@@ -107,7 +107,8 @@ $(BUILD)/%.o: %.asm | dirs
 # boot_blobs.asm uses incbin to embed the stage binaries -- declare the dep
 # so it rebuilds when stage1/stage2 change.
 $(BUILD)/kernel/boot_blobs.o: $(BUILD)/boot/stage1.bin $(BUILD)/boot/stage2.bin \
-                              $(BUILD)/boot/stage1_hdd.bin $(BUILD)/boot/stage2_hdd.bin
+                              $(BUILD)/boot/stage1_hdd.bin $(BUILD)/boot/stage2_hdd.bin \
+                              $(BUILD)/boot/mbr.bin
 
 $(KERNEL): $(KERNEL_OBJ) kernel/kernel.ld
 	$(LD) $(LDFLAGS) -o $(BUILD)/kernel.elf $(KERNEL_OBJ)

@@ -4,6 +4,7 @@
 #include "string.h"
 #include "fs.h"
 #include "disk.h"
+#include "mbr.h"
 #include "env.h"
 #include "elf.h"
 #include "net.h"
@@ -68,6 +69,19 @@ static int cmd_env   (int argc, char **argv);
 static int cmd_setenv(int argc, char **argv);
 static int cmd_asm   (int argc, char **argv);
 static int cmd_elf_cmd(int argc, char **argv);
+static int cmd_parts    (int argc, char **argv);
+static int cmd_mkpart   (int argc, char **argv);
+static int cmd_delpart  (int argc, char **argv);
+static int cmd_setactive(int argc, char **argv);
+static int cmd_mkmbr    (int argc, char **argv);
+static int cmd_df       (int argc, char **argv);
+static int cmd_du       (int argc, char **argv);
+static int cmd_find     (int argc, char **argv);
+static int cmd_grep     (int argc, char **argv);
+static int cmd_more     (int argc, char **argv);
+static int cmd_history  (int argc, char **argv);
+static int cmd_alias    (int argc, char **argv);
+static int cmd_unalias  (int argc, char **argv);
 
 static const struct cmd commands[] = {
     /* shell */
@@ -102,9 +116,29 @@ static const struct cmd commands[] = {
     { "umount",  "umount <letter>     detach drive",             cmd_umount  },
     { "scan",    "rescan storage controllers",                   cmd_scan    },
     { "drv",     "list mounted drives",                          cmd_drives  },
-    { "format",  "format <devname|num> [label]  wipe + FAT16",   cmd_format  },
+    { "format",  "format <devname|num> [label]  wipe + FAT",     cmd_format  },
     { "flash",   "flash <devname|num> <file>  write raw image to device", cmd_flash },
     { "install", "install [devname]  setup wizard (interactive)",cmd_install },
+
+    /* partitioning */
+    { "parts",    "parts <devname>     show MBR partition table",    cmd_parts    },
+    { "mkpart",   "mkpart <devname> [type] [start sectors]  create partition", cmd_mkpart   },
+    { "delpart",  "delpart <devname> <1..4>  remove partition entry", cmd_delpart  },
+    { "setactive","setactive <devname> <1..4>  set boot flag",       cmd_setactive},
+    { "mkmbr",    "mkmbr <devname>     wipe MBR and write chainloader", cmd_mkmbr  },
+
+    /* search + paging */
+    { "df",      "df                   show free space per drive",   cmd_df      },
+    { "du",      "du [path]            recursive directory size",    cmd_du      },
+    { "find",    "find <pattern> [path]  recursive name search",     cmd_find    },
+    { "grep",    "grep <text> <file>   substring search",            cmd_grep    },
+    { "more",    "more <file>          page through a file",         cmd_more    },
+
+    /* shell extras */
+    { "history", "history              show command history",        cmd_history },
+    { "alias",   "alias [name=cmd]     show / add command alias",    cmd_alias   },
+    { "unalias", "unalias <name>       remove an alias",             cmd_unalias },
+
     { "wget",     "wget <url> [-o out] HTTP GET to local file",     cmd_wget    },
     { "ping",     "ping <host>        ICMP echo, 4 times (resolves)", cmd_ping    },
     { "nslookup", "nslookup <name>    DNS A-record lookup",            cmd_nslookup},
@@ -416,9 +450,9 @@ static int cmd_zbc(int argc, char **argv) { return cmd_cc(argc, argv); }
 /* --- storage ------------------------------------------------------- */
 static int cmd_lsblk(int argc, char **argv) {
     (void)argc; (void)argv;
-    kputs(" DEV  NAME  SECTORS    MB   MOUNT\n");
+    kputs(" DEV  NAME      SECTORS     MiB   MOUNT  KIND\n");
     int any = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < DISK_MAX; i++) {
         struct disk *d = disk_get(i);
         if (!d || !d->present) continue;
         any = 1;
@@ -427,24 +461,58 @@ static int cmd_lsblk(int argc, char **argv) {
             if (fs_drive_disk_id(L) == i) { mount = L; break; }
         }
         u32 mb = d->sectors / 2048;
-        kprintf("  %d   %-4s  %7u   %3u   %c%s\n", i, d->name, d->sectors, mb,
-                mount == '-' ? '-' : mount, mount == '-' ? "" : ":");
+        const char *kind = "disk";
+        char detail[16] = "";
+        if (i >= PART_SLOT_BASE) {
+            int raw, part; u32 start; u8 type;
+            if (mbr_view_info(i, &raw, &part, &start, NULL, &type, NULL) == 0) {
+                kind = "part";
+                ksnprintf(detail, sizeof detail, "type=%02X", type);
+            }
+        } else if (mbr_has_table(i)) {
+            kind = "mbr";
+        }
+        kprintf("  %2d  %-8s %7u  %6u   %c%s   %s %s\n", i, d->name,
+                d->sectors, mb,
+                mount == '-' ? '-' : mount, mount == '-' ? " " : ":",
+                kind, detail);
     }
     if (!any) kputs("  (no block devices detected)\n");
     return 0;
 }
 
+/* Resolve a device argument to a slot index. Accepts the disk name
+ * (hda, hda1, ahci0p1), a bare digit, or "A:".."D:". Searches all of
+ * DISK_MAX, so partition views and view-disks both work. */
 static int dev_from_arg(const char *s) {
-    /* "hda"/"hdb" -> 0/1; digits -> number; "0".."3" handled too. */
-    for (int i = 0; i < 4; i++) {
+    if (!s || !*s) return -1;
+    /* "X:" -> mounted-drive disk-id */
+    if (s[0] && s[1] == ':' && s[2] == '\0') {
+        int id = fs_drive_disk_id(s[0]);
+        if (id >= 0) return id;
+    }
+    for (int i = 0; i < DISK_MAX; i++) {
         struct disk *d = disk_get(i);
         if (d && d->present && strcasecmp(s, d->name) == 0) return i;
     }
+    /* Bare digit. */
     int n = 0, any = 0;
     for (const char *p = s; *p; p++) {
         if (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); any = 1; }
+        else { any = 0; break; }
     }
-    return any ? n : -1;
+    if (any && n >= 0 && n < DISK_MAX) {
+        struct disk *d = disk_get(n);
+        if (d && d->present) return n;
+    }
+    return -1;
+}
+
+/* Resolve to a RAW disk only (rejects partition views). For MBR ops. */
+static int raw_from_arg(const char *s) {
+    int id = dev_from_arg(s);
+    if (id < 0 || id >= DISK_RAW_MAX) return -1;
+    return id;
 }
 
 static int cmd_mount(int argc, char **argv) {
@@ -517,11 +585,21 @@ static int cmd_drives(int argc, char **argv) {
 static int cmd_format(int argc, char **argv) {
     if (argc < 2) {
         kputs("usage: format <devname|num> [label]\n");
+        kputs("  Works on raw disks (superfloppy layout) or partitions (hda1).\n");
         return 0;
     }
     int dev = dev_from_arg(argv[1]);
-    if (dev < 0 || dev >= 4 || !disk_get(dev)->present) {
+    if (dev < 0 || !disk_get(dev)->present) {
         kprintf("format: unknown device: %s\n", argv[1]);
+        return 0;
+    }
+    /* Refuse to format a raw disk that already carries an MBR -- the
+     * user almost certainly wants `format <part>`, not to wipe the
+     * partition table. */
+    if (dev < DISK_RAW_MAX && mbr_has_table(dev)) {
+        kprintf("format: %s has a partition table. Use `format %s1` "
+                "(or a partition name) instead.\n",
+                disk_get(dev)->name, disk_get(dev)->name);
         return 0;
     }
     const char *label = (argc > 2) ? argv[2] : "ZENBITE";
@@ -529,7 +607,8 @@ static int cmd_format(int argc, char **argv) {
     for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++) {
         if (fs_drive_disk_id(L) == dev) fs_unmount(L);
     }
-    kprintf("formatting %s as FAT16 (label %s)... ", disk_get(dev)->name, label);
+    kprintf("formatting %s (%u sectors) as FAT (label %s)... ",
+            disk_get(dev)->name, disk_get(dev)->sectors, label);
     if (fs_format(dev, label) < 0) {
         kputs("FAILED\n");
         return 0;
@@ -660,10 +739,56 @@ static void show_ip(const char *label, ip4_addr_t a) {
             (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
+/* Parse "MM/DD/YYYY" or "YYYY-MM-DD"; returns 0 on success. */
+static int parse_date(const char *s, u32 *mm, u32 *dd, u32 *yy) {
+    u32 a = 0, b = 0, c = 0;
+    int i = 0;
+    while (s[i] >= '0' && s[i] <= '9') a = a * 10 + (u32)(s[i++] - '0');
+    if (s[i] != '/' && s[i] != '-') return -1;
+    char sep = s[i++];
+    while (s[i] >= '0' && s[i] <= '9') b = b * 10 + (u32)(s[i++] - '0');
+    if (s[i] != sep) return -1;
+    i++;
+    while (s[i] >= '0' && s[i] <= '9') c = c * 10 + (u32)(s[i++] - '0');
+    if (s[i] != '\0') return -1;
+    if (sep == '/') { *mm = a; *dd = b; *yy = c; }
+    else            { *yy = a; *mm = b; *dd = c; }
+    return 0;
+}
+
+static int parse_hms(const char *s, u32 *hh, u32 *mm, u32 *ss) {
+    u32 a = 0, b = 0, c = 0;
+    int i = 0;
+    while (s[i] >= '0' && s[i] <= '9') a = a * 10 + (u32)(s[i++] - '0');
+    if (s[i] != ':') return -1;
+    i++;
+    while (s[i] >= '0' && s[i] <= '9') b = b * 10 + (u32)(s[i++] - '0');
+    if (s[i] == '\0') { *hh = a; *mm = b; *ss = 0; return 0; }
+    if (s[i] != ':') return -1;
+    i++;
+    while (s[i] >= '0' && s[i] <= '9') c = c * 10 + (u32)(s[i++] - '0');
+    if (s[i] != '\0') return -1;
+    *hh = a; *mm = b; *ss = c;
+    return 0;
+}
+
 static int cmd_date(int argc, char **argv) {
-    (void)argc; (void)argv;
     struct rtc_time t;
     rtc_read(&t);
+    if (argc >= 2) {
+        u32 mm, dd, yy;
+        if (parse_date(argv[1], &mm, &dd, &yy) < 0) {
+            kputs("usage: date [MM/DD/YYYY | YYYY-MM-DD]\n");
+            return 1;
+        }
+        if (mm < 1 || mm > 12 || dd < 1 || dd > 31 || yy < 1980 || yy > 2099) {
+            kputs("date: out of range\n"); return 1;
+        }
+        t.month = (u8)mm; t.day = (u8)dd; t.year = (u16)yy;
+        rtc_write(&t);
+        kprintf("date set to %04u-%02u-%02u\n", yy, mm, dd);
+        return 0;
+    }
     if (!t.year) { kputs("date: RTC unavailable\n"); return 1; }
     static const char *months[] = {
         "?", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -675,9 +800,21 @@ static int cmd_date(int argc, char **argv) {
 }
 
 static int cmd_time(int argc, char **argv) {
-    (void)argc; (void)argv;
     struct rtc_time t;
     rtc_read(&t);
+    if (argc >= 2) {
+        u32 hh, mm, ss;
+        if (parse_hms(argv[1], &hh, &mm, &ss) < 0) {
+            kputs("usage: time [HH:MM[:SS]]\n"); return 1;
+        }
+        if (hh > 23 || mm > 59 || ss > 59) {
+            kputs("time: out of range\n"); return 1;
+        }
+        t.hour = (u8)hh; t.min = (u8)mm; t.sec = (u8)ss;
+        rtc_write(&t);
+        kprintf("time set to %02u:%02u:%02u\n", hh, mm, ss);
+        return 0;
+    }
     if (!t.year) { kputs("time: RTC unavailable\n"); return 1; }
     kprintf("%02u:%02u:%02u\n", (u32)t.hour, (u32)t.min, (u32)t.sec);
     return 0;
@@ -761,6 +898,485 @@ static int cmd_elf_cmd(int argc, char **argv) {
     int rc = elf_exec(argv[1]);
     if (rc != 0) kprintf("elf: exited with code %d\n", rc);
     return 0;
+}
+
+/* --- partitioning -------------------------------------------------- */
+static const char *part_type_name(u8 t) {
+    switch (t) {
+    case MBR_TYPE_EMPTY:   return "empty";
+    case MBR_TYPE_FAT12:   return "FAT12";
+    case MBR_TYPE_FAT16S:  return "FAT16 (CHS, small)";
+    case MBR_TYPE_EXTENDED:return "Extended";
+    case MBR_TYPE_FAT16:   return "FAT16 (CHS)";
+    case MBR_TYPE_FAT32:   return "FAT32 (CHS)";
+    case MBR_TYPE_FAT32L:  return "FAT32 (LBA)";
+    case MBR_TYPE_FAT16L:  return "FAT16 (LBA)";
+    case 0x07:             return "NTFS/exFAT";
+    case 0x82:             return "Linux swap";
+    case 0x83:             return "Linux";
+    default:               return "other";
+    }
+}
+
+static u8 parse_type(const char *s) {
+    if (strcasecmp(s, "fat16") == 0) return MBR_TYPE_FAT16L;
+    if (strcasecmp(s, "fat32") == 0) return MBR_TYPE_FAT32L;
+    if (strcasecmp(s, "fat12") == 0) return MBR_TYPE_FAT12;
+    /* Allow a raw hex byte like "0E". */
+    int v = 0;
+    for (int i = 0; s[i]; i++) {
+        char c = s[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return 0;
+        v = v * 16 + d;
+    }
+    return (u8)v;
+}
+
+static int cmd_parts(int argc, char **argv) {
+    if (argc < 2) { kputs("usage: parts <devname>  (e.g. parts hda)\n"); return 1; }
+    int dev = raw_from_arg(argv[1]);
+    if (dev < 0) { kprintf("parts: %s is not a raw disk\n", argv[1]); return 1; }
+    struct disk *d = disk_get(dev);
+    struct mbr_part pt[MBR_PART_MAX];
+    if (mbr_read(dev, pt) < 0) {
+        kprintf("%s: no MBR partition table (use `mkmbr %s` to create one)\n",
+                d->name, d->name);
+        return 0;
+    }
+    kprintf(" %s   total %u sectors (%u MiB)\n", d->name,
+            d->sectors, d->sectors / 2048);
+    kputs("  # boot   start_LBA       sectors        MiB  type\n");
+    for (int i = 0; i < MBR_PART_MAX; i++) {
+        if (pt[i].type == 0) {
+            kprintf("  %d   --    --              --             --  empty\n", i + 1);
+            continue;
+        }
+        kprintf("  %d   %c    %10u  %10u   %6u  %02X  %s\n",
+                i + 1, pt[i].boot == 0x80 ? '*' : ' ',
+                pt[i].start_lba, pt[i].sectors, pt[i].sectors / 2048,
+                pt[i].type, part_type_name(pt[i].type));
+    }
+    u32 fs, fc;
+    if (mbr_largest_free(dev, &fs, &fc) == 0)
+        kprintf(" largest free span: LBA %u..%u  (%u MiB)\n",
+                fs, fs + fc - 1, fc / 2048);
+    return 0;
+}
+
+static int cmd_mkpart(int argc, char **argv) {
+    if (argc < 2) {
+        kputs("usage: mkpart <devname> [fat16|fat32|HEX] [start sectors]\n");
+        kputs("  Defaults: type=auto, start/sectors=largest free span.\n");
+        return 1;
+    }
+    int dev = raw_from_arg(argv[1]);
+    if (dev < 0) { kprintf("mkpart: %s is not a raw disk\n", argv[1]); return 1; }
+    struct disk *d = disk_get(dev);
+
+    /* Make sure there's an MBR; create one if not. */
+    if (!mbr_has_table(dev)) {
+        kprintf("mkpart: %s has no MBR; writing one ...\n", d->name);
+        if (mbr_init_disk(dev) < 0) { kputs("mkpart: mkmbr failed\n"); return 1; }
+    }
+
+    u32 start = 0, count = 0;
+    u8  type  = 0;
+    if (argc >= 3) type = parse_type(argv[2]);
+    if (argc >= 5) {
+        for (const char *p = argv[3]; *p; p++) start = start * 10 + (u32)(*p - '0');
+        for (const char *p = argv[4]; *p; p++) count = count * 10 + (u32)(*p - '0');
+    }
+    if (count == 0) {
+        u32 fs, fc;
+        if (mbr_largest_free(dev, &fs, &fc) < 0 || fc < 2048) {
+            kputs("mkpart: no free space on disk\n"); return 1;
+        }
+        start = fs; count = fc;
+    }
+    if (type == 0) type = mbr_suggest_type(count);
+
+    /* Find an empty slot. */
+    struct mbr_part pt[MBR_PART_MAX];
+    if (mbr_read(dev, pt) < 0) memset(pt, 0, sizeof pt);
+    int slot = -1;
+    for (int i = 0; i < MBR_PART_MAX; i++) if (pt[i].type == 0) { slot = i; break; }
+    if (slot < 0) { kputs("mkpart: no free partition slot (max 4)\n"); return 1; }
+
+    int active = 1;
+    for (int i = 0; i < MBR_PART_MAX; i++) if (pt[i].boot == 0x80) { active = 0; break; }
+
+    int r = mbr_create_partition(dev, slot, type, start, count, active);
+    if (r < 0) { kprintf("mkpart: failed (rc=%d)\n", r); return 1; }
+    kprintf("mkpart: created %s partition %d at LBA %u, %u sectors (%u MiB)%s\n",
+            part_type_name(type), slot + 1, start, count, count / 2048,
+            active ? " [active]" : "");
+    fs_rescan();
+    return 0;
+}
+
+static int cmd_delpart(int argc, char **argv) {
+    if (argc < 3) { kputs("usage: delpart <devname> <1..4>\n"); return 1; }
+    int dev = raw_from_arg(argv[1]);
+    if (dev < 0) { kprintf("delpart: %s is not a raw disk\n", argv[1]); return 1; }
+    int slot = argv[2][0] - '0' - 1;
+    if (slot < 0 || slot >= MBR_PART_MAX) { kputs("delpart: slot must be 1..4\n"); return 1; }
+    /* Unmount any drive sitting on this partition. */
+    int view = mbr_view_for(dev, slot);
+    if (view >= 0) {
+        for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
+            if (fs_drive_disk_id(L) == view) fs_unmount(L);
+    }
+    if (mbr_delete_partition(dev, slot) < 0) {
+        kputs("delpart: failed\n"); return 1;
+    }
+    kprintf("delpart: removed partition %d\n", slot + 1);
+    fs_rescan();
+    return 0;
+}
+
+static int cmd_setactive(int argc, char **argv) {
+    if (argc < 3) { kputs("usage: setactive <devname> <1..4>\n"); return 1; }
+    int dev = raw_from_arg(argv[1]);
+    if (dev < 0) { kprintf("setactive: %s is not a raw disk\n", argv[1]); return 1; }
+    int slot = argv[2][0] - '0' - 1;
+    if (slot < 0 || slot >= MBR_PART_MAX) { kputs("setactive: slot must be 1..4\n"); return 1; }
+    if (mbr_set_active(dev, slot) < 0) { kputs("setactive: failed\n"); return 1; }
+    kprintf("setactive: partition %d is now bootable\n", slot + 1);
+    return 0;
+}
+
+static int cmd_mkmbr(int argc, char **argv) {
+    if (argc < 2) { kputs("usage: mkmbr <devname>\n"); return 1; }
+    int dev = raw_from_arg(argv[1]);
+    if (dev < 0) { kprintf("mkmbr: %s is not a raw disk\n", argv[1]); return 1; }
+    /* Unmount everything that uses any partition of this disk. */
+    for (int v = PART_SLOT_BASE; v < DISK_MAX; v++) {
+        int raw;
+        if (mbr_view_info(v, &raw, NULL, NULL, NULL, NULL, NULL) == 0 && raw == dev) {
+            for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
+                if (fs_drive_disk_id(L) == v) fs_unmount(L);
+        }
+    }
+    if (mbr_init_disk(dev) < 0) { kputs("mkmbr: failed\n"); return 1; }
+    kprintf("mkmbr: wrote chainloader MBR + empty partition table to %s\n",
+            disk_get(dev)->name);
+    fs_rescan();
+    return 0;
+}
+
+/* --- df / du / find / grep / more ------------------------------------ */
+static u32 walk_size(const char *dir) {
+    int dh = fs_opendir(dir);
+    if (dh < 0) return 0;
+    struct fs_dirent e;
+    u32 total = 0;
+    while (fs_readdir(dh, &e)) {
+        if (e.attr & FS_ATTR_DIR) {
+            if (e.name[0] == '.') continue;
+            char sub[FS_PATH_MAX];
+            ksnprintf(sub, sizeof sub, "%s\\%s", dir, e.name);
+            total += walk_size(sub);
+        } else {
+            total += e.size;
+        }
+    }
+    fs_closedir(dh);
+    return total;
+}
+
+static int cmd_df(int argc, char **argv) {
+    (void)argc; (void)argv;
+    kputs(" DRIVE  DEVICE   SIZE_MiB   USED_MiB   FREE_MiB\n");
+    for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++) {
+        int id = fs_drive_disk_id(L);
+        if (id < 0) continue;
+        struct disk *d = disk_get(id);
+        char path[8]; ksnprintf(path, sizeof path, "%c:\\", L);
+        u32 used = walk_size(path);
+        u32 size_kb = (d->sectors / 2);
+        u32 used_kb = used / 1024;
+        u32 free_kb = (size_kb > used_kb) ? (size_kb - used_kb) : 0;
+        kprintf("   %c:    %-8s  %7u    %7u    %7u\n", L, d ? d->name : "?",
+                size_kb / 1024, used_kb / 1024, free_kb / 1024);
+    }
+    return 0;
+}
+
+static void du_walk(const char *path, int depth) {
+    int dh = fs_opendir(path);
+    if (dh < 0) return;
+    struct fs_dirent e;
+    while (fs_readdir(dh, &e)) {
+        if (e.name[0] == '.') continue;
+        char sub[FS_PATH_MAX];
+        ksnprintf(sub, sizeof sub, "%s\\%s", path, e.name);
+        if (e.attr & FS_ATTR_DIR) {
+            u32 sz = walk_size(sub);
+            kprintf("%8u K  %s\n", sz / 1024, sub);
+            if (depth > 0) du_walk(sub, depth - 1);
+        }
+    }
+    fs_closedir(dh);
+    u32 total = walk_size(path);
+    kprintf("%8u K  %s   (total)\n", total / 1024, path);
+}
+
+static int cmd_du(int argc, char **argv) {
+    char path[FS_PATH_MAX];
+    if (argc > 1) {
+        if (argv[1][0] && argv[1][1] == ':')
+            strncpy(path, argv[1], sizeof path - 1);
+        else
+            ksnprintf(path, sizeof path, "%c:%s\\%s", fs_get_drive(), fs_cwd(), argv[1]);
+    } else {
+        ksnprintf(path, sizeof path, "%c:%s", fs_get_drive(), fs_cwd());
+    }
+    path[sizeof path - 1] = '\0';
+    /* Collapse double backslashes from concatenating root + name. */
+    for (char *p = path; *p && p[1]; ) {
+        if (p[0] == '\\' && p[1] == '\\') {
+            for (char *q = p; *q; q++) q[0] = q[1];
+        } else p++;
+    }
+    du_walk(path, 1);
+    return 0;
+}
+
+/* Wildcard match: '*' = any run, '?' = single char. Case-insensitive. */
+static int wild_match(const char *pat, const char *str) {
+    if (*pat == '\0') return *str == '\0';
+    if (*pat == '*') {
+        for (; *str; str++) if (wild_match(pat + 1, str)) return 1;
+        return wild_match(pat + 1, str);
+    }
+    if (*str == '\0') return 0;
+    if (*pat == '?' || toupper((u8)*pat) == toupper((u8)*str))
+        return wild_match(pat + 1, str + 1);
+    return 0;
+}
+
+static void find_walk(const char *pat, const char *dir, int *count) {
+    int dh = fs_opendir(dir);
+    if (dh < 0) return;
+    struct fs_dirent e;
+    while (fs_readdir(dh, &e)) {
+        if (e.name[0] == '.') continue;
+        char full[FS_PATH_MAX];
+        ksnprintf(full, sizeof full, "%s\\%s", dir, e.name);
+        if (wild_match(pat, e.name)) {
+            kprintf("  %s%s\n", full, (e.attr & FS_ATTR_DIR) ? "\\" : "");
+            (*count)++;
+        }
+        if (e.attr & FS_ATTR_DIR) find_walk(pat, full, count);
+    }
+    fs_closedir(dh);
+}
+
+static int cmd_find(int argc, char **argv) {
+    if (argc < 2) {
+        kputs("usage: find <pattern> [path]   ('*' and '?' supported)\n");
+        return 1;
+    }
+    char path[FS_PATH_MAX];
+    if (argc > 2)
+        ksnprintf(path, sizeof path, "%s", argv[2]);
+    else
+        ksnprintf(path, sizeof path, "%c:%s", fs_get_drive(), fs_cwd());
+    int n = 0;
+    find_walk(argv[1], path, &n);
+    kprintf(" %d match(es)\n", n);
+    return 0;
+}
+
+static int cmd_grep(int argc, char **argv) {
+    if (argc < 3) { kputs("usage: grep <text> <file>\n"); return 1; }
+    int h = fs_open(argv[2]);
+    if (h < 0) { kprintf("grep: %s: not found\n", argv[2]); return 1; }
+    static char line[256];
+    int len = 0, lineno = 1, hits = 0;
+    char buf[256];
+    int n;
+    const char *needle = argv[1];
+    size_t nlen = strlen(needle);
+    while ((n = fs_read(h, buf, sizeof buf)) > 0) {
+        for (int i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\r') continue;
+            if (c == '\n' || len >= (int)sizeof line - 1) {
+                line[len] = '\0';
+                /* Case-insensitive substring search. */
+                for (int s = 0; s + (int)nlen <= len; s++) {
+                    int j;
+                    for (j = 0; j < (int)nlen; j++)
+                        if (toupper((u8)line[s + j]) != toupper((u8)needle[j])) break;
+                    if (j == (int)nlen) {
+                        kprintf("%4d: %s\n", lineno, line);
+                        hits++;
+                        break;
+                    }
+                }
+                len = 0;
+                if (c == '\n') lineno++;
+            } else {
+                line[len++] = c;
+            }
+        }
+    }
+    fs_close(h);
+    kprintf(" %d match(es)\n", hits);
+    return 0;
+}
+
+static int cmd_more(int argc, char **argv) {
+    if (argc < 2) { kputs("usage: more <file>\n"); return 1; }
+    int h = fs_open(argv[1]);
+    if (h < 0) { kprintf("more: %s: not found\n", argv[1]); return 1; }
+    char buf[256];
+    int n, rows = 0;
+    while ((n = fs_read(h, buf, sizeof buf)) > 0) {
+        for (int i = 0; i < n; i++) {
+            kputc(buf[i]);
+            if (buf[i] == '\n') {
+                rows++;
+                if (rows >= 22) {
+                    kputs("-- more -- (space = page, q = quit)");
+                    int k = kb_getc();
+                    kputs("\r                                  \r");
+                    if (k == 'q' || k == 'Q' || k == 27) {
+                        fs_close(h); return 0;
+                    }
+                    rows = 0;
+                }
+            }
+        }
+    }
+    fs_close(h);
+    return 0;
+}
+
+/* --- history + aliases (state owned here, accessed by shell.c) -------- */
+#define HIST_MAX  32
+#define ALIAS_MAX 16
+#define ALIAS_NAME_LEN 16
+#define ALIAS_VAL_LEN  64
+
+static char g_hist[HIST_MAX][128];
+static int  g_hist_count;       /* total inserts (g_hist[g_hist_count % HIST_MAX] is oldest) */
+
+static struct {
+    char name[ALIAS_NAME_LEN];
+    char value[ALIAS_VAL_LEN];
+} g_alias[ALIAS_MAX];
+
+void shell_history_add(const char *line) {
+    if (!line || !*line) return;
+    /* Skip duplicates of the previous entry. */
+    if (g_hist_count > 0) {
+        int prev = (g_hist_count - 1) % HIST_MAX;
+        if (strcmp(g_hist[prev], line) == 0) return;
+    }
+    int idx = g_hist_count % HIST_MAX;
+    strncpy(g_hist[idx], line, sizeof g_hist[idx] - 1);
+    g_hist[idx][sizeof g_hist[idx] - 1] = '\0';
+    g_hist_count++;
+}
+
+/* Returns the i'th most-recent entry (0 = most recent), or NULL. */
+const char *shell_history_get(int back) {
+    if (back < 0 || back >= HIST_MAX || back >= g_hist_count) return NULL;
+    int idx = (g_hist_count - 1 - back + HIST_MAX * 100) % HIST_MAX;
+    return g_hist[idx];
+}
+
+int shell_alias_lookup(const char *name, char *out, int outsz) {
+    for (int i = 0; i < ALIAS_MAX; i++) {
+        if (g_alias[i].name[0] && strcasecmp(g_alias[i].name, name) == 0) {
+            strncpy(out, g_alias[i].value, (size_t)outsz - 1);
+            out[outsz - 1] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int cmd_history(int argc, char **argv) {
+    (void)argc; (void)argv;
+    int n = g_hist_count < HIST_MAX ? g_hist_count : HIST_MAX;
+    int first = g_hist_count - n;
+    for (int i = 0; i < n; i++) {
+        int idx = (first + i) % HIST_MAX;
+        kprintf(" %4d  %s\n", first + i + 1, g_hist[idx]);
+    }
+    if (n == 0) kputs(" (no history)\n");
+    return 0;
+}
+
+static int cmd_alias(int argc, char **argv) {
+    if (argc < 2) {
+        int any = 0;
+        for (int i = 0; i < ALIAS_MAX; i++) {
+            if (g_alias[i].name[0]) {
+                kprintf("  alias %s='%s'\n", g_alias[i].name, g_alias[i].value);
+                any = 1;
+            }
+        }
+        if (!any) kputs("  (no aliases)\n");
+        return 0;
+    }
+    /* Concatenate remaining args; allow "alias ll=ls -l" with spaces. */
+    char arg[ALIAS_NAME_LEN + ALIAS_VAL_LEN + 2];
+    int p = 0;
+    for (int i = 1; i < argc && p < (int)sizeof arg - 1; i++) {
+        if (i > 1 && p < (int)sizeof arg - 1) arg[p++] = ' ';
+        for (int j = 0; argv[i][j] && p < (int)sizeof arg - 1; j++)
+            arg[p++] = argv[i][j];
+    }
+    arg[p] = '\0';
+    char *eq = strchr(arg, '=');
+    if (!eq) {
+        kputs("usage: alias name=value\n");
+        return 1;
+    }
+    *eq = '\0';
+    const char *val = eq + 1;
+    /* Strip surrounding quotes from value. */
+    if (val[0] == '"' || val[0] == '\'') val++;
+    int vlen = (int)strlen(val);
+    char vbuf[ALIAS_VAL_LEN];
+    int copy = vlen < (int)sizeof vbuf - 1 ? vlen : (int)sizeof vbuf - 1;
+    memcpy(vbuf, val, (size_t)copy);
+    vbuf[copy] = '\0';
+    if (copy > 0 && (vbuf[copy - 1] == '"' || vbuf[copy - 1] == '\''))
+        vbuf[copy - 1] = '\0';
+
+    int free_slot = -1, found = -1;
+    for (int i = 0; i < ALIAS_MAX; i++) {
+        if (!g_alias[i].name[0]) { if (free_slot < 0) free_slot = i; }
+        else if (strcasecmp(g_alias[i].name, arg) == 0) { found = i; break; }
+    }
+    int slot = (found >= 0) ? found : free_slot;
+    if (slot < 0) { kputs("alias: table full\n"); return 1; }
+    strncpy(g_alias[slot].name, arg, sizeof g_alias[slot].name - 1);
+    g_alias[slot].name[sizeof g_alias[slot].name - 1] = '\0';
+    strncpy(g_alias[slot].value, vbuf, sizeof g_alias[slot].value - 1);
+    g_alias[slot].value[sizeof g_alias[slot].value - 1] = '\0';
+    return 0;
+}
+
+static int cmd_unalias(int argc, char **argv) {
+    if (argc < 2) { kputs("usage: unalias <name>\n"); return 1; }
+    for (int i = 0; i < ALIAS_MAX; i++) {
+        if (g_alias[i].name[0] && strcasecmp(g_alias[i].name, argv[1]) == 0) {
+            g_alias[i].name[0] = '\0';
+            return 0;
+        }
+    }
+    kprintf("unalias: %s: not found\n", argv[1]);
+    return 1;
 }
 
 /* --- power --------------------------------------------------------- */

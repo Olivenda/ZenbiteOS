@@ -82,3 +82,38 @@ void rtc_read(struct rtc_time *t) {
     t->sec = t->min = t->hour = t->day = t->month = 0;
     t->year = 0;
 }
+
+static u8 bin_to_bcd(u8 v) {
+    return (u8)(((v / 10) << 4) | (v % 10));
+}
+
+/* Write the wall clock back to CMOS. Disables RTC updates around the
+ * write so a half-updated field can't be latched. Used by Settings. */
+void rtc_write(const struct rtc_time *t) {
+    u8 reg_b = cmos_read(0x0B);
+    int bcd  = !(reg_b & 0x04);
+    /* Pause updates: set SET=1 (bit 7). */
+    outb(CMOS_INDEX, 0x8B);
+    outb(CMOS_DATA,  (u8)(reg_b | 0x80));
+
+    u8 sec   = bcd ? bin_to_bcd(t->sec)   : t->sec;
+    u8 min   = bcd ? bin_to_bcd(t->min)   : t->min;
+    u8 hour  = bcd ? bin_to_bcd(t->hour)  : t->hour;
+    u8 day   = bcd ? bin_to_bcd(t->day)   : t->day;
+    u8 month = bcd ? bin_to_bcd(t->month) : t->month;
+    u8 yr2   = (u8)(t->year % 100);
+    u8 cent  = (u8)(t->year / 100);
+    if (bcd) { yr2 = bin_to_bcd(yr2); cent = bin_to_bcd(cent); }
+
+    outb(CMOS_INDEX, 0x80); outb(CMOS_DATA, sec);
+    outb(CMOS_INDEX, 0x82); outb(CMOS_DATA, min);
+    outb(CMOS_INDEX, 0x84); outb(CMOS_DATA, hour);
+    outb(CMOS_INDEX, 0x87); outb(CMOS_DATA, day);
+    outb(CMOS_INDEX, 0x88); outb(CMOS_DATA, month);
+    outb(CMOS_INDEX, 0x89); outb(CMOS_DATA, yr2);
+    outb(CMOS_INDEX, 0xB2); outb(CMOS_DATA, cent);
+
+    /* Resume updates. */
+    outb(CMOS_INDEX, 0x8B);
+    outb(CMOS_DATA,  reg_b);
+}

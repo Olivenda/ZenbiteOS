@@ -116,6 +116,34 @@ This disk holds the system files (kernel, loader, version tag) under
 
 Do not modify files on this disk.
 TXT
+# Default wallpaper image. Loaded by the desktop's "Image" wallpaper
+# style. Plain ASCII -- the user can replace with any 80x24 art.
+cat > "$SYS1/WALL.TXT" <<'TXT'
++----------------------------------------------------------------------------+
+|                                                                            |
+|                          Z   E   N   B   I   T   E                         |
+|                          ---------------------                             |
+|                                                                            |
+|                              o   o   o   o                                 |
+|                                                                            |
+|                          A 32-bit retro OS                                 |
+|                                                                            |
+|                                                                            |
+|                                                                            |
+|        ......................................................             |
+|        ......................................................             |
+|                                                                            |
+|                                                                            |
+|                                                                            |
+|                                                                            |
+|                                                                            |
+|                  Settings > Pattern > Image (WALL.TXT)                     |
+|                                                                            |
+|                  Edit A:\WALL.TXT to customise.                            |
+|                                                                            |
+|                                                                            |
++----------------------------------------------------------------------------+
+TXT
 mmd -i "$INST1" ::/SYSTEM
 for f in "$SYS1"/SYSTEM/*; do mcopy -i "$INST1" "$f" "::/SYSTEM/$(basename "$f")"; done
 mmd -i "$INST1" ::/BOOT
@@ -123,6 +151,7 @@ for f in "$SYS1"/BOOT/*; do mcopy -i "$INST1" "$f" "::/BOOT/$(basename "$f")"; d
 mmd -i "$INST1" ::/BIN
 mcopy -i "$INST1" "$SYS1/INSTALL.TAG" ::/INSTALL.TAG
 mcopy -i "$INST1" "$SYS1/README.TXT"  ::/README.TXT
+mcopy -i "$INST1" "$SYS1/WALL.TXT"    ::/WALL.TXT
 rm -rf "$SYS1"
 echo "built $INST1 (Setup Disk 1)"
 

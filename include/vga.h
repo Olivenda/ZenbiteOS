@@ -23,6 +23,7 @@ enum vga_colour {
 };
 
 void vga_init(void);
+void vga_set_glyph(u8 code, const u8 bitmap[16]);
 void vga_clear(void);
 void vga_putc(char c);
 void vga_puts(const char *s);

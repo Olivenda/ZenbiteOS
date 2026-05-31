@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "fs.h"
 #include "disk.h"
+#include "mbr.h"
 #include "string.h"
 
 #define SECTOR_SIZE  512
@@ -957,6 +958,17 @@ int fs_closedir(int h) {
 static int format_fat16(int disk_id, const char *label, u32 total);
 static int format_fat32(int disk_id, const char *label, u32 total);
 
+/* If disk_id is a partition view-disk, return its absolute LBA offset
+ * within the parent disk. Returns 0 for raw disks / unknown. The BPB's
+ * hidden_sectors field MUST be set to this value so stage1_hdd can
+ * compute disk-absolute LBAs for INT 13h AH=42h. */
+static u32 disk_partition_offset(int disk_id) {
+    u32 start = 0;
+    if (mbr_view_info(disk_id, NULL, NULL, &start, NULL, NULL, NULL) == 0)
+        return start;
+    return 0;
+}
+
 int fs_format(int disk_id, const char *label) {
     struct disk *d = disk_get(disk_id);
     if (!d || !d->present) return -1;
@@ -1009,6 +1021,14 @@ static int format_fat16(int disk_id, const char *label, u32 total) {
     boot[23] = (fat_secs >> 8) & 0xFF;
     boot[24] = 63;
     boot[26] = 16;
+    /* hidden_sectors at offset 0x1C: absolute LBA of this BPB on the
+     * parent disk. Zero on superfloppies; non-zero on partitions so
+     * stage1_hdd can compute absolute LBAs for INT 13h. */
+    u32 hidden = disk_partition_offset(disk_id);
+    boot[28] = (u8)(hidden);
+    boot[29] = (u8)(hidden >> 8);
+    boot[30] = (u8)(hidden >> 16);
+    boot[31] = (u8)(hidden >> 24);
     if (total > 0xFFFF) {
         boot[32] = total & 0xFF;
         boot[33] = (total >> 8) & 0xFF;
@@ -1080,6 +1100,14 @@ static int format_fat32(int disk_id, const char *label, u32 total) {
     /* fat_size_16 = 0 on FAT32 -- the 32-bit value lives at offset 36. */
     boot[24] = 63;
     boot[26] = 16;
+    /* hidden_sectors at offset 0x1C: see format_fat16(). */
+    {
+        u32 hidden = disk_partition_offset(disk_id);
+        boot[28] = (u8)(hidden);
+        boot[29] = (u8)(hidden >> 8);
+        boot[30] = (u8)(hidden >> 16);
+        boot[31] = (u8)(hidden >> 24);
+    }
     boot[32] = total & 0xFF;
     boot[33] = (total >> 8) & 0xFF;
     boot[34] = (total >> 16) & 0xFF;

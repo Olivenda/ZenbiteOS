@@ -17,6 +17,13 @@ static volatile char buf[BUF_SIZE];
 static volatile u32  head, tail;
 
 static int shift_down, ctrl_down, caps_lock, altgr_down;
+
+/* Sticky Ctrl+C flag. Cleared by kb_intr_consume(); set whenever the
+ * scancode for ^C is processed. The shell polls this between commands
+ * (and inside long-running builtins) to bail out. */
+volatile int g_intr;
+int kb_intr_pending(void) { return g_intr; }
+void kb_intr_consume(void) { g_intr = 0; }
 static int ext_flag = 0;
 
 /* Keyboard layout. 0 = US, 1 = DE (QWERTZ). The two layouts differ a lot
@@ -152,6 +159,9 @@ static void on_irq1(void) {
         case 0x3D: fkey = (char)KB_F3; break;
         case 0x3E: fkey = (char)KB_F4; break;
         case 0x3F: fkey = (char)KB_F5; break;
+        case 0x40: fkey = (char)KB_F6; break;
+        case 0x41: fkey = (char)KB_F7; break;
+        case 0x42: fkey = (char)KB_F8; break;
         default:   break;
     }
     if (fkey) { enqueue(fkey); return; }
@@ -166,6 +176,12 @@ static void on_irq1(void) {
     if (!c) return;
     if (caps_lock && c >= 'a' && c <= 'z') c -= 32;
     else if (caps_lock && c >= 'A' && c <= 'Z' && !shift_down) c += 32;
+    /* Ctrl+letter -> control character (0x03 = Ctrl+C, used to interrupt
+     * the running shell command). Latched via g_intr so a long-running
+     * builtin can poll for the flag between iterations. */
+    if (ctrl_down && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
+    else if (ctrl_down && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+    if (c == 0x03) g_intr = 1;
     enqueue(c);
 }
 

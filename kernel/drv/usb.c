@@ -248,10 +248,9 @@ static void small_delay(void) {
 /* Busy-wait until a TD's Active bit clears (or error/timeout).
  * Returns 1 on success, 0 on error or timeout. */
 static int td_wait(volatile struct uhci_td *td) {
-    for (int t = 0; t < 500000; t++) {
+    for (int t = 0; t < 5000000; t++) {
         u32 cs = td->ctlsts;
         if (!(cs & TD_CS_ACTIVE)) {
-            /* Check error bits */
             if (cs & (TD_CS_STALLED|TD_CS_BUFERR|TD_CS_BABBLE|TD_CS_CRCTO))
                 return 0;
             return 1;
@@ -302,24 +301,22 @@ static int ctrl_transfer(u8 addr, u8 ep, void *data, u16 len, int in, int ls) {
         n_tds++;
     }
 
-    /* Hook ctrl QH into frame 0 */
+    /* Hook ctrl QH into every frame slot so the HC executes it on the
+     * next 1 ms tick instead of waiting for frame 0 to come back
+     * around (~1024 ms with the QH parked only in slot 0). */
     g_ctrl_qh.head    = LP_TERMINATE;
     g_ctrl_qh.element = LP_TD(&g_ctrl_td[0]);
-    g_frame_list[0]   = LP_QH_PTR(&g_ctrl_qh);
+    for (int i = 0; i < 1024; i++) g_frame_list[i] = LP_QH_PTR(&g_ctrl_qh);
 
     /* Wait for all TDs */
+    int ok = 1;
     for (u32 i = 0; i < n_tds; i++) {
-        if (!td_wait(&g_ctrl_td[i])) {
-            /* Detach on failure */
-            g_frame_list[0] = LP_TERMINATE;
-            g_ctrl_qh.element = LP_TERMINATE;
-            return 0;
-        }
+        if (!td_wait(&g_ctrl_td[i])) { ok = 0; break; }
     }
 
-    g_frame_list[0] = LP_TERMINATE;
+    for (int i = 0; i < 1024; i++) g_frame_list[i] = LP_TERMINATE;
     g_ctrl_qh.element = LP_TERMINATE;
-    return 1;
+    return ok;
 }
 
 /* Convenience: build a standard SETUP packet in g_setup_buf */
@@ -358,6 +355,286 @@ static int usb_set_protocol(u8 addr, u8 iface, u8 proto, int ls) {
     /* HID Set_Protocol: bmRequestType=0x21, bRequest=0x0B */
     make_setup(0x21, 0x0B, proto, iface, 0);
     return ctrl_transfer(addr, 0, NULL, 0, 0, ls);
+}
+
+/* ── Bulk transfer + USB Mass Storage (BBB / SCSI) ────────────────────
+ *
+ * Bulk-Only Transport (BBB) sequence:
+ *   1. Host sends a 31-byte CBW (Command Block Wrapper) via bulk OUT.
+ *   2. Optional data phase via bulk IN or OUT, depending on bmCBWFlags.
+ *   3. Host reads a 13-byte CSW (Command Status Wrapper) via bulk IN.
+ *
+ * Inside the CBW we pack a SCSI Reduced Block Commands (RBC)
+ * command -- INQUIRY, TEST UNIT READY, READ CAPACITY (10), READ (10),
+ * WRITE (10). The driver registers each LUN found as a block device
+ * via disk_get(), so the existing FAT layer mounts it like any ATA
+ * drive.  The disk slot range USB_DISK_BASE..+USB_DISK_MAX is carved
+ * out of disk.h's table.
+ *
+ * Only one BBB request is in flight at a time. The bulk endpoints
+ * share the static control TD table -- safe because all transfers
+ * are synchronous + the polling QHs live on different TDs. */
+
+#define USB_DISK_BASE 10
+#define USB_DISK_MAX  2   /* slots 10..11 for UHCI MSC; 12..15 -> EHCI */
+#define BULK_MAX_TDS  64
+
+static struct uhci_td g_bulk_td[BULK_MAX_TDS] __attribute__((aligned(16)));
+
+struct msc_dev {
+    int  in_use;
+    u8   addr;
+    u8   ep_in, ep_out;
+    u16  maxp_in, maxp_out;
+    u8   tog_in, tog_out;
+    int  ls;
+    u32  block_count;
+    u32  block_size;
+    int  disk_slot;
+};
+static struct msc_dev g_msc[USB_DISK_MAX];
+
+static int bulk_transfer(struct msc_dev *m, int dir_in,
+                         void *data, u32 len) {
+    u8  ep    = dir_in ? m->ep_in  : m->ep_out;
+    u16 maxp  = dir_in ? m->maxp_in : m->maxp_out;
+    u8  pid   = dir_in ? PID_IN     : PID_OUT;
+    u8 *togp  = dir_in ? &m->tog_in : &m->tog_out;
+    u32 ls_bit = m->ls ? TD_CS_LS : 0;
+    if (maxp == 0) maxp = 64;
+
+    u32 ntds = 0, off = 0;
+    do {
+        u32 chunk = len - off;
+        if (chunk > maxp) chunk = maxp;
+        g_bulk_td[ntds].link    = LP_TD(&g_bulk_td[ntds + 1]);
+        g_bulk_td[ntds].ctlsts  = TD_CS_ERRCNT(3) | ls_bit | TD_CS_ACTIVE;
+        g_bulk_td[ntds].token   = make_token(pid, m->addr, ep, *togp, (u16)chunk);
+        g_bulk_td[ntds].buffer  = (u32)((u8 *)data + off);
+        *togp ^= 1;
+        off += chunk;
+        ntds++;
+        if (ntds >= BULK_MAX_TDS) break;
+        if (len == 0) break;
+    } while (off < len);
+
+    if (ntds == 0) return 1;
+    g_bulk_td[ntds - 1].link = LP_TERMINATE;
+
+    g_ctrl_qh.head    = LP_TERMINATE;
+    g_ctrl_qh.element = LP_TD(&g_bulk_td[0]);
+    for (int i = 0; i < 1024; i++) g_frame_list[i] = LP_QH_PTR(&g_ctrl_qh);
+
+    int ok = 1;
+    for (u32 i = 0; i < ntds; i++)
+        if (!td_wait(&g_bulk_td[i])) { ok = 0; break; }
+
+    for (int i = 0; i < 1024; i++) g_frame_list[i] = LP_TERMINATE;
+    g_ctrl_qh.element = LP_TERMINATE;
+    return ok;
+}
+
+/* Run one CBW -> [data] -> CSW round-trip. Returns 0 on success
+ * (CSW status = passed) or -1 on transport / SCSI failure. */
+static int bbb_request(struct msc_dev *m,
+                       const u8 *cdb, u8 cdb_len,
+                       void *data, u32 data_len, int dir_in) {
+    static u8 cbw[31] __attribute__((aligned(4)));
+    static u8 csw[13] __attribute__((aligned(4)));
+    static u32 tag = 0x42424201;
+
+    for (int i = 0; i < 31; i++) cbw[i] = 0;
+    /* dCBWSignature 'USBC' little-endian */
+    cbw[0]=0x55; cbw[1]=0x53; cbw[2]=0x42; cbw[3]=0x43;
+    /* dCBWTag */
+    cbw[4]=tag&0xFF;   cbw[5]=(tag>>8)&0xFF;
+    cbw[6]=(tag>>16)&0xFF; cbw[7]=(tag>>24)&0xFF;
+    tag++;
+    /* dCBWDataTransferLength */
+    cbw[8]=data_len&0xFF;   cbw[9]=(data_len>>8)&0xFF;
+    cbw[10]=(data_len>>16)&0xFF; cbw[11]=(data_len>>24)&0xFF;
+    /* bmCBWFlags: bit7=1 for IN, 0 for OUT */
+    cbw[12] = dir_in ? 0x80 : 0x00;
+    cbw[13] = 0;          /* bCBWLUN */
+    cbw[14] = cdb_len;    /* bCBWCBLength */
+    for (int i = 0; i < cdb_len && i < 16; i++) cbw[15 + i] = cdb[i];
+
+    if (!bulk_transfer(m, 0, cbw, 31))     return -1;
+    if (data_len && data) {
+        if (!bulk_transfer(m, dir_in, data, data_len)) return -1;
+    }
+    if (!bulk_transfer(m, 1, csw, 13))     return -1;
+    /* Validate CSW. */
+    if (csw[0]!=0x55||csw[1]!=0x53||csw[2]!=0x42||csw[3]!=0x53) return -1;
+    if (csw[12] != 0) return -1;        /* bCSWStatus: 0=pass */
+    return 0;
+}
+
+/* SCSI helpers ------------------------------------------------------- */
+
+static int scsi_inquiry(struct msc_dev *m, u8 *out36) {
+    u8 cdb[6] = { 0x12, 0, 0, 0, 36, 0 };
+    return bbb_request(m, cdb, 6, out36, 36, 1);
+}
+
+static int scsi_test_unit_ready(struct msc_dev *m) {
+    u8 cdb[6] = { 0x00, 0, 0, 0, 0, 0 };
+    return bbb_request(m, cdb, 6, NULL, 0, 0);
+}
+
+static int scsi_read_capacity(struct msc_dev *m, u32 *last_lba, u32 *block_size) {
+    u8 cdb[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    u8 data[8];
+    if (bbb_request(m, cdb, 10, data, 8, 1) != 0) return -1;
+    *last_lba   = ((u32)data[0]<<24) | ((u32)data[1]<<16) | ((u32)data[2]<<8) | data[3];
+    *block_size = ((u32)data[4]<<24) | ((u32)data[5]<<16) | ((u32)data[6]<<8) | data[7];
+    return 0;
+}
+
+static int scsi_read10(struct msc_dev *m, u32 lba, u16 count, void *buf) {
+    u8 cdb[10] = {
+        0x28, 0,
+        (u8)(lba>>24), (u8)(lba>>16), (u8)(lba>>8), (u8)lba,
+        0,
+        (u8)(count>>8), (u8)count,
+        0
+    };
+    return bbb_request(m, cdb, 10, buf, (u32)count * m->block_size, 1);
+}
+
+static int scsi_write10(struct msc_dev *m, u32 lba, u16 count, const void *buf) {
+    u8 cdb[10] = {
+        0x2A, 0,
+        (u8)(lba>>24), (u8)(lba>>16), (u8)(lba>>8), (u8)lba,
+        0,
+        (u8)(count>>8), (u8)count,
+        0
+    };
+    return bbb_request(m, cdb, 10, (void *)buf, (u32)count * m->block_size, 0);
+}
+
+/* Disk-layer adapters: the FS speaks 512-byte sectors. Most USB sticks
+ * report a 512-byte block size, so we pass count straight through. For
+ * the rare 4 KiB-block drive we'd need to convert; that's left for a
+ * future cleanup -- guarded by a kprintf below. */
+
+#include "../../include/disk.h"
+
+/* Cap per-SCSI-request transfer so the data phase fits in our
+ * BULK_MAX_TDS pool: with maxp=64, 4 sectors = 32 packets = 32 TDs,
+ * leaving room for the CBW/CSW. Larger I/O loops here. */
+#define MSC_IO_CHUNK_SECTORS 4
+
+static int msc_disk_read(struct disk *d, u32 lba, u32 count, void *buf) {
+    struct msc_dev *m = (struct msc_dev *)d->priv;
+    if (!m) return -1;
+    while (count) {
+        u16 chunk = count > MSC_IO_CHUNK_SECTORS ? MSC_IO_CHUNK_SECTORS : (u16)count;
+        if (scsi_read10(m, lba, chunk, buf) != 0) {
+            kprintf("usb-msc: READ(10) lba=%u failed\n", lba);
+            return -1;
+        }
+        lba   += chunk;
+        count -= chunk;
+        buf    = (u8 *)buf + (u32)chunk * 512;
+    }
+    return 0;
+}
+
+static int msc_disk_write(struct disk *d, u32 lba, u32 count, const void *buf) {
+    struct msc_dev *m = (struct msc_dev *)d->priv;
+    if (!m) return -1;
+    while (count) {
+        u16 chunk = count > MSC_IO_CHUNK_SECTORS ? MSC_IO_CHUNK_SECTORS : (u16)count;
+        if (scsi_write10(m, lba, chunk, buf) != 0) return -1;
+        lba   += chunk;
+        count -= chunk;
+        buf    = (const u8 *)buf + (u32)chunk * 512;
+    }
+    return 0;
+}
+
+/* After enumeration captures the bulk endpoints, drive INQUIRY +
+ * (retry) TEST UNIT READY + READ CAPACITY, then register the LUN as
+ * a block device. */
+static int msc_attach(u8 addr, u8 ep_in, u8 ep_out,
+                      u16 maxp_in, u16 maxp_out, int ls) {
+    int slot = -1;
+    for (int i = 0; i < USB_DISK_MAX; i++)
+        if (!g_msc[i].in_use) { slot = i; break; }
+    if (slot < 0) return -1;
+    struct msc_dev *m = &g_msc[slot];
+    m->in_use = 1;
+    m->addr = addr;
+    m->ep_in = ep_in; m->ep_out = ep_out;
+    m->maxp_in = maxp_in; m->maxp_out = maxp_out;
+    m->tog_in = 0; m->tog_out = 0;
+    m->ls = ls;
+
+    u8 inq[36];
+    if (scsi_inquiry(m, inq) != 0) {
+        kputs("usb-msc: INQUIRY failed\n");
+        m->in_use = 0; return -1;
+    }
+
+    /* Some sticks need several TUR retries to spin up. */
+    for (int i = 0; i < 5; i++) {
+        if (scsi_test_unit_ready(m) == 0) break;
+    }
+
+    u32 last_lba = 0, blksz = 512;
+    if (scsi_read_capacity(m, &last_lba, &blksz) != 0) {
+        kputs("usb-msc: READ CAPACITY failed\n");
+        m->in_use = 0; return -1;
+    }
+    m->block_count = last_lba + 1;
+    m->block_size  = blksz;
+
+    int disk_slot = USB_DISK_BASE + slot;
+    struct disk *d = disk_get(disk_slot);
+    if (!d) { m->in_use = 0; return -1; }
+    d->present = 1;
+    d->sectors = m->block_count;   /* assumes 512-byte sectors */
+    d->read    = msc_disk_read;
+    d->write   = msc_disk_write;
+    d->priv    = m;
+    const char *nm = "usb";
+    int k = 0;
+    d->name[k++] = nm[0]; d->name[k++] = nm[1]; d->name[k++] = nm[2];
+    d->name[k++] = (char)('0' + slot);
+    d->name[k]   = '\0';
+    m->disk_slot = disk_slot;
+
+    kprintf("usb-msc: %s %u MiB (block=%u)\n",
+            d->name, (m->block_count / (1024 * 1024 / blksz)), blksz);
+    if (blksz != 512)
+        kputs("usb-msc: warning: block size != 512; FAT may not mount\n");
+    return 0;
+}
+
+/* Re-populate the disk table for every attached USB MSC LUN. Called
+ * from vfs_init() *after* disk_init() / ata_init() / ahci_init() /
+ * floppy_init() -- those wipe and refill slots 0..9, so we wait until
+ * they're done before claiming our slots 10..13. */
+void usb_msc_register_disks(void) {
+    for (int i = 0; i < USB_DISK_MAX; i++) {
+        if (!g_msc[i].in_use) continue;
+        struct msc_dev *m = &g_msc[i];
+        int slot = USB_DISK_BASE + i;
+        struct disk *d = disk_get(slot);
+        if (!d) continue;
+        d->present = 1;
+        d->sectors = m->block_count;
+        d->read    = msc_disk_read;
+        d->write   = msc_disk_write;
+        d->priv    = m;
+        const char *nm = "usb";
+        int k = 0;
+        d->name[k++] = nm[0]; d->name[k++] = nm[1]; d->name[k++] = nm[2];
+        d->name[k++] = (char)('0' + i);
+        d->name[k]   = '\0';
+        m->disk_slot = slot;
+    }
 }
 
 /* Enumerate a device freshly attached on a port.
@@ -444,10 +721,20 @@ static int enumerate_device(u8 port_ls) {
     }
 
     if (found_msc) {
-        kprintf("usb: mass-storage iface=%u IN ep%u/%u  OUT ep%u/%u "
-                "(BBB transport not yet implemented)\n",
+        kprintf("usb: mass-storage iface=%u IN ep%u/%u  OUT ep%u/%u\n",
                 iface_msc, ep_msc_in, msc_maxp_in,
                 ep_msc_out, msc_maxp_out);
+        /* Activate config so the bulk endpoints come online, then run
+         * the BBB INQUIRY / READ-CAPACITY handshake and register the
+         * LUN as a block device. We use addr=1 like HID does -- only
+         * one USB device per controller is supported in this build. */
+        if (usb_set_config(1, cfg_val, port_ls)) {
+            (void)msc_attach(1, ep_msc_in, ep_msc_out,
+                             msc_maxp_in, msc_maxp_out, port_ls);
+            /* Return 3 so probe_port logs MSC attachment without
+             * clobbering the HID-only return contract. */
+            if (!found_kbd && !found_mouse) return 3;
+        }
     }
 
     if (!found_kbd && !found_mouse) return 0;

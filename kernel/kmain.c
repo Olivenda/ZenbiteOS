@@ -63,6 +63,7 @@ void kmain(struct boot_info *bi) {
     mouse_init();
     kputs("kmain: timer+kbd+mouse up\n");
     usb_init();
+    ehci_init();
     kputs("kmain: usb done\n");
 
     cpu_detect(NULL);

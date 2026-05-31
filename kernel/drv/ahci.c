@@ -283,7 +283,14 @@ static u32 ahci_identify(int p) {
 /* ── Public initialisation ───────────────────────────────────────────── */
 
 void ahci_init(void) {
-    /* Find AHCI controller via PCI */
+    /* Find AHCI controller via PCI. Class 0x01 (Mass Storage),
+     * sub-class 0x06 (SATA). The PI (programming interface) byte is
+     * 0x01 for "AHCI 1.0" mode in spec, but real boards report
+     * 0x00 (vendor-specific) and 0x05/0x06 (NVMHCI variants) too.
+     * We accept any non-zero PI -- BAR5 is what really matters -- and
+     * also probe class=0x01 sub=0x04 (RAID with AHCI behind it), which
+     * is how many modern motherboards expose SATA when the BIOS picks
+     * "RAID" mode by default. */
     u8 bus = 0, dev = 0, fn = 0;
     int found = 0;
     for (u32 b = 0; b < 256 && !found; b++) {
@@ -292,10 +299,14 @@ void ahci_init(void) {
                 u32 id = apci_r32(b, d, f, 0);
                 if (id == 0xFFFFFFFF) continue;
                 u32 cc = apci_r32(b, d, f, 8);
-                if ((cc >> 24) == 0x01 && ((cc >> 16) & 0xFF) == 0x06
-                    && ((cc >> 8) & 0xFF) == 0x01) {
-                    bus = b; dev = d; fn = f; found = 1;
-                }
+                u8 cls = cc >> 24, sub = (cc >> 16) & 0xFF;
+                if (cls != 0x01) continue;
+                if (sub != 0x06 && sub != 0x04) continue;
+                /* BAR5 must be MMIO (bit 0 == 0) and non-zero, else
+                 * this is a legacy IDE controller with no AHCI HBA. */
+                u32 bar5 = apci_r32(b, d, f, 0x24);
+                if ((bar5 & 1) || (bar5 & ~0xFu) == 0) continue;
+                bus = b; dev = d; fn = f; found = 1;
             }
         }
     }

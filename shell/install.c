@@ -20,6 +20,7 @@
 #include "string.h"
 #include "fs.h"
 #include "disk.h"
+#include "mbr.h"
 #include "tui.h"
 
 #define BUFSZ 4096
@@ -126,12 +127,19 @@ static int install_bootloader(int target_disk, char target_letter) {
     static u8 boot_sector[512];
     char path[FS_PATH_MAX];
 
-    /* Pick the right boot pair for the target type. ATA/AHCI slots 0..7
-     * are HDDs (FAT16 + BPB + INT 13h LBA); floppy slots 8..9 use the
-     * FAT12 / CHS pair. The HDD blobs were carefully designed to read
-     * the BPB from sector 0, so they work for any FAT16 volume the
-     * formatter produces -- not just 64 MiB. */
-    int is_hdd = (target_disk < 8);
+    /* Pick the right boot pair for the target type:
+     *   - partition view (slot >= PART_SLOT_BASE) -> HDD pair, and the
+     *     parent disk needs an active boot flag on that partition;
+     *   - raw ATA/AHCI (0..7)                     -> HDD pair (superfloppy);
+     *   - raw FDC / USB                           -> floppy pair. */
+    int is_partition = (target_disk >= PART_SLOT_BASE);
+    int parent_disk  = target_disk;
+    int part_index   = -1;
+    if (is_partition) {
+        mbr_view_info(target_disk, &parent_disk, &part_index,
+                      NULL, NULL, NULL, NULL);
+    }
+    int is_hdd = is_partition ? 1 : (target_disk < 8);
     u8  *stage1_src = is_hdd ? stage1_hdd_blob : stage1_blob;
     u32  stage1_sz  = is_hdd ? stage1_hdd_blob_size : stage1_blob_size;
     u8  *stage2_src = is_hdd ? stage2_hdd_blob : stage2_blob;
@@ -195,6 +203,20 @@ static int install_bootloader(int target_disk, char target_letter) {
     write_file(path, stage2_src, (int)stage2_sz);
 
     log_line("  SYSTEM/ und BOOT/ befuellt.");
+
+    /* For partition installs: mark this partition as the active boot
+     * one in the parent disk's MBR so the chainloader jumps to it on
+     * power-up. (The MBR itself was either pre-existing or written by
+     * the picker via mbr_init_disk + mkpart.) */
+    if (is_partition && part_index >= 0) {
+        if (mbr_set_active(parent_disk, part_index) < 0) {
+            log_line("  WARN: konnte Boot-Flag nicht setzen");
+        } else {
+            log_line("  Boot-Flag auf %s%d gesetzt.",
+                     disk_get(parent_disk) ? disk_get(parent_disk)->name : "?",
+                     part_index + 1);
+        }
+    }
     return 0;
 }
 
@@ -317,97 +339,208 @@ static void draw_welcome(void) {
 
 extern int  fs_rescan(void);
 
-static int pick_target_disk(void) {
-rescan:
+/* Build a one-line description of a disk slot for the picker. */
+static void describe_slot(int id, char *out, int outsz) {
+    struct disk *d = disk_get(id);
+    if (!d || !d->present) { ksnprintf(out, (size_t)outsz, "  --"); return; }
+    char mount = '-';
+    for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
+        if (fs_drive_disk_id(L) == id) mount = L;
+
+    if (id >= PART_SLOT_BASE) {
+        int raw, part; u32 start; u8 type, boot;
+        mbr_view_info(id, &raw, &part, &start, NULL, &type, &boot);
+        struct disk *parent = disk_get(raw);
+        const char *what = "frei (kein FAT)";
+        if (mount != '-') {
+            if (file_exists(mount, "INSTALL.TAG")) what = "Setup-Medium";
+            else if (file_exists(mount, "SYSTEM\\ZENBITE.SYS")) what = "bereits installiert";
+            else what = "FAT, beschreibbar";
+        }
+        ksnprintf(out, (size_t)outsz, " %2d  %-7s P%d %3u MiB %c%s %s",
+                  id, d->name, part + 1, d->sectors / 2048,
+                  boot == 0x80 ? '*' : ' ',
+                  parent && parent->name[0] ? "" : "",
+                  what);
+    } else {
+        const char *what;
+        if (mbr_has_table(id))      what = "MBR-Partitionen vorhanden";
+        else if (mount != '-') {
+            if (file_exists(mount, "INSTALL.TAG"))             what = "Setupdisk (read-only)";
+            else if (file_exists(mount, "SYSTEM\\ZENBITE.SYS")) what = "bereits installiert (superfloppy)";
+            else                                                what = "FAT-Superfloppy";
+        }
+        else                        what = "leer (keine Partitionstabelle)";
+        u32 mib = d->sectors / 2048;
+        ksnprintf(out, (size_t)outsz, " %2d  %-7s    %4u MiB   %s",
+                  id, d->name, mib, what);
+    }
+}
+
+/* Show a "no targets found" panel and wait for F5/ESC. */
+static int wait_for_target(int r, int c, int w, int h) {
     tui_clear();
     title_bar();
-    status_keys("  ENTER=ausw\xE4""hlen   F5=Rescan   ESC=zurueck                                   ");
-
-    int w = 66, h = 18;
-    int r = 3, c = (VGA_COLS - w) / 2;
     tui_dbl_box(r, c, w, h);
     vga_write(r + 1, c + (w - 28) / 2,
               " Schritt 1: Zieldatentraeger ", TUI_TITLE_FG, TUI_BG);
-    tui_print(r + 3, c + 3, " #  GERAET  GROESSE   ZUSTAND");
+    tui_print(r + 4, c + 3, "  Kein Datentraeger gefunden.");
+    tui_print(r + 5, c + 3, "  Bitte Disk anschliessen und F5 druecken,");
+    tui_print(r + 6, c + 3, "  oder ESC zum Abbrechen.");
+    for (;;) {
+        int k = kb_getc();
+        if (k == 27) return -1;
+        if (k == (int)KB_F5 || k == 'r' || k == 'R') { fs_rescan(); return 1; }
+    }
+}
 
+/* Target picker. Returns:
+ *    >= 0     disk id of chosen partition or raw disk
+ *    -1       user aborted
+ *
+ * Special key 'P' on a raw-disk row partitions the disk on the fly
+ * (creates a single FAT partition covering all free space, then re-
+ * scans and returns the new partition's id). 'M' wipes the MBR.
+ * That lets a brand-new disk become a usable install target without
+ * dropping back to the shell. */
+static int pick_target_disk(void) {
+rescan: {
+    int w = 70, h = 20;
+    int r = 3, c = (VGA_COLS - w) / 2;
     int rows[DISK_MAX]; int rn = 0;
-    for (int i = 0; i < DISK_MAX; i++) {
+
+    /* Build the row list: every present raw disk plus every present
+     * partition view. Partition views come right after their parent
+     * for visual grouping. */
+    for (int i = 0; i < DISK_RAW_MAX; i++) {
         struct disk *d = disk_get(i);
         if (!d || !d->present) continue;
-        char line[80];
-        char mount = '-';
-        for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
-            if (fs_drive_disk_id(L) == i) mount = L;
-        const char *what = "leer/nicht formatiert";
-        if (mount != '-') {
-            if (file_exists(mount, "INSTALL.TAG")) what = "Setupdisk (read-only)";
-            else if (file_exists(mount, "SYSTEM\\ZENBITE.SYS")) what = "bereits installiert";
-            else what = "mounted, beschreibbar";
-        }
-        u32 mb = d->sectors / 2048;
-        ksnprintf(line, sizeof line, " %d   %-5s   %4u MB  %s", i, d->name, mb, what);
-        tui_print(r + 5 + rn, c + 3, line);
         rows[rn++] = i;
+        for (int p = 0; p < MBR_PART_MAX; p++) {
+            int v = mbr_view_for(i, p);
+            if (v >= 0) rows[rn++] = v;
+        }
     }
     if (rn == 0) {
-        tui_clear();
-        title_bar();
-        tui_dbl_box(r, c, w, h);
-        vga_write(r + 1, c + (w - 28) / 2,
-                  " Schritt 1: Zieldatentraeger ", TUI_TITLE_FG, TUI_BG);
-        tui_print(r + 4, c + 3, "  Kein Datentraeger gefunden.");
-        tui_print(r + 5, c + 3, "  Bitte Disk anschliessen und F5 (Rescan) druecken.");
-        tui_print(r + 6, c + 3, "  Oder ESC zum Abbrechen.");
-        tui_print(r + 8, c + 3, "  [ F5=Neu suchen   ESC=Beenden ]");
-        for (;;) {
-            int k = kb_getc();
-            if (k == 27) return -1;
-            if (k == (int)KB_F5 || k == 'r' || k == 'R') {
-                fs_rescan();
-                goto rescan;
-            }
-        }
+        if (wait_for_target(r, c, w, h) < 0) return -1;
+        goto rescan;
     }
 
+    tui_clear();
+    title_bar();
+    status_keys("  ENTER=auswaehlen  P=Partition anlegen  M=MBR  F5=Rescan  ESC=zurueck   ");
+    tui_dbl_box(r, c, w, h);
+    vga_write(r + 1, c + (w - 28) / 2,
+              " Schritt 1: Zieldatentraeger ", TUI_TITLE_FG, TUI_BG);
+    tui_print(r + 3, c + 3, " ID  GERAET            GROESSE   ZUSTAND");
+
     int sel = 0;
+    /* Prefer a partition row over a raw row by default. */
+    for (int i = 0; i < rn; i++) if (rows[i] >= PART_SLOT_BASE) { sel = i; break; }
+
     for (;;) {
-        for (int i = 0; i < rn; i++) {
-            char line[80];
-            struct disk *d = disk_get(rows[i]);
-            char mount = '-';
-            for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
-                if (fs_drive_disk_id(L) == rows[i]) mount = L;
-            const char *what = "leer/nicht formatiert";
-            if (mount != '-') {
-                if (file_exists(mount, "INSTALL.TAG")) what = "Setupdisk (read-only)";
-                else if (file_exists(mount, "SYSTEM\\ZENBITE.SYS")) what = "bereits installiert";
-                else what = "mounted, beschreibbar";
-            }
-            u32 mb = d->sectors / 2048;
-            ksnprintf(line, sizeof line, " %d   %-5s   %4u MB  %s",
-                      rows[i], d->name, mb, what);
-            if (i == sel) {
-                int len = (int)strlen(line);
-                for (int x = 0; x < w - 6; x++)
-                    vga_put_cell(r + 5 + i, c + 3 + x,
-                                 x < len ? line[x] : ' ', TUI_HIGH_FG, TUI_HIGH_BG);
-            } else {
-                vga_fill (r + 5 + i, c + 3, w - 6, 1, ' ', TUI_FG, TUI_BG);
-                vga_write(r + 5 + i, c + 3, line, TUI_FG, TUI_BG);
-            }
+        int max_rows = h - 6;
+        int top = 0;
+        if (rn > max_rows) {
+            top = sel - max_rows / 2;
+            if (top < 0) top = 0;
+            if (top > rn - max_rows) top = rn - max_rows;
         }
+        for (int i = 0; i < max_rows; i++) {
+            int idx = top + i;
+            if (idx >= rn) {
+                vga_fill(r + 5 + i, c + 3, w - 6, 1, ' ', TUI_FG, TUI_BG);
+                continue;
+            }
+            char line[96];
+            describe_slot(rows[idx], line, sizeof line);
+            int hl = (idx == sel);
+            int len = (int)strlen(line);
+            for (int x = 0; x < w - 6; x++)
+                vga_put_cell(r + 5 + i, c + 3 + x,
+                             x < len ? line[x] : ' ',
+                             hl ? TUI_HIGH_FG : TUI_FG,
+                             hl ? TUI_HIGH_BG : TUI_BG);
+        }
+        /* Hint line at bottom. */
+        int help_row = r + h - 2;
+        vga_fill (help_row, c + 3, w - 6, 1, ' ', TUI_FG, TUI_BG);
+        int chosen = rows[sel];
+        if (chosen >= PART_SLOT_BASE)
+            vga_write(help_row, c + 3,
+                      "ENTER = diese Partition formatieren und installieren.",
+                      TUI_FG, TUI_BG);
+        else if (mbr_has_table(chosen))
+            vga_write(help_row, c + 3,
+                      "Disk hat Partitionen -- waehle eine Partition aus.",
+                      TUI_FG, TUI_BG);
+        else
+            vga_write(help_row, c + 3,
+                      "Disk ohne Partitionen -- P fuer Partition, ENTER = Superfloppy.",
+                      TUI_FG, TUI_BG);
 
         int k = kb_getc();
         if (k == 27) return -1;
-        if (k == (int)KB_F5 || k == 'r' || k == 'R') { fs_rescan(); goto rescan; }
-        if (k == 'j' || k == ' ' || k == KB_DOWN) sel = (sel + 1) % rn;
-        else if (k == 'k' || k == KB_UP)          sel = (sel + rn - 1) % rn;
-        else if (k >= '0' && k <= '9') {
-            int want = k - '0';
-            for (int i = 0; i < rn; i++) if (rows[i] == want) { sel = i; break; }
-        }
+        if (k == (int)KB_F5) { fs_rescan(); goto rescan; }
+        if (k == KB_DOWN || k == 'j' || k == ' ') sel = (sel + 1) % rn;
+        else if (k == KB_UP || k == 'k')          sel = (sel + rn - 1) % rn;
         else if (k == '\n' || k == '\r') return rows[sel];
+        else if (k == 'p' || k == 'P') {
+            int dev = rows[sel];
+            if (dev >= PART_SLOT_BASE) {
+                int raw;
+                mbr_view_info(dev, &raw, NULL, NULL, NULL, NULL, NULL);
+                dev = raw;
+            }
+            if (dev < 0 || dev >= DISK_RAW_MAX) continue;
+            if (!tui_confirm("Auf dieser Disk eine neue Partition anlegen?"))
+                continue;
+            /* Ensure an MBR exists. */
+            if (!mbr_has_table(dev)) mbr_init_disk(dev);
+            u32 fs, fc;
+            if (mbr_largest_free(dev, &fs, &fc) < 0 || fc < 2048) {
+                tui_alert("Kein freier Platz auf dieser Disk.");
+                continue;
+            }
+            /* Find first empty slot. */
+            struct mbr_part pt[MBR_PART_MAX];
+            mbr_read(dev, pt);
+            int slot = -1;
+            for (int i = 0; i < MBR_PART_MAX; i++) if (pt[i].type == 0) { slot = i; break; }
+            if (slot < 0) { tui_alert("Alle 4 Partitions-Slots belegt."); continue; }
+            int rc = mbr_create_partition(dev, slot, mbr_suggest_type(fc),
+                                          fs, fc, 1);
+            if (rc < 0) { tui_alert("Partition anlegen fehlgeschlagen."); continue; }
+            fs_rescan();
+            goto rescan;
+        }
+        else if (k == 'm' || k == 'M') {
+            int dev = rows[sel];
+            if (dev >= PART_SLOT_BASE) {
+                int raw;
+                mbr_view_info(dev, &raw, NULL, NULL, NULL, NULL, NULL);
+                dev = raw;
+            }
+            if (dev < 0 || dev >= DISK_RAW_MAX) continue;
+            if (!tui_confirm("MBR neu schreiben (loescht alle Partitionen)?"))
+                continue;
+            /* Unmount any partition currently mounted from this disk. */
+            for (int v = PART_SLOT_BASE; v < DISK_MAX; v++) {
+                int raw;
+                if (mbr_view_info(v, &raw, NULL, NULL, NULL, NULL, NULL) == 0
+                        && raw == dev) {
+                    for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++)
+                        if (fs_drive_disk_id(L) == v) fs_unmount(L);
+                }
+            }
+            if (mbr_init_disk(dev) < 0) {
+                tui_alert("MBR schreiben fehlgeschlagen."); continue;
+            }
+            fs_rescan();
+            goto rescan;
+        }
     }
+}
 }
 
 
@@ -422,6 +555,8 @@ static int g_log_col;
 static int g_log_w;
 static int g_log_top;        /* first row of the scrolling region */
 static int g_log_bot;        /* last row of the scrolling region */
+static int g_bar_row, g_bar_col, g_bar_w;
+static int g_bar_active;
 
 static void log_init(int row, int col, int w) {
     g_log_row = row; g_log_col = col; g_log_w = w;
@@ -453,6 +588,33 @@ static void log_line(const char *fmt, ...) {
     g_log_row++;
 }
 
+static void draw_progress_bar(void) {
+    if (!g_bar_active) return;
+    int filled = 0;
+    if (g_copy_total > 0) {
+        filled = (g_copy_done * (g_bar_w - 2)) / g_copy_total;
+        if (filled > g_bar_w - 2) filled = g_bar_w - 2;
+        if (filled < 0) filled = 0;
+    }
+    /* Border */
+    vga_put_cell(g_bar_row, g_bar_col,                ' ', TUI_FG, TUI_BG);
+    vga_put_cell(g_bar_row, g_bar_col + g_bar_w - 1, ' ', TUI_FG, TUI_BG);
+    /* Track + fill: 0xDB = full block. */
+    for (int x = 0; x < g_bar_w - 2; x++) {
+        char ch = (x < filled) ? (char)0xDB : (char)0xB0;
+        u8 fg   = (x < filled) ? VGA_LIGHT_GREEN : VGA_LIGHT_GREY;
+        vga_put_cell(g_bar_row, g_bar_col + 1 + x, ch, fg, TUI_BG);
+    }
+    char label[32];
+    int pct = g_copy_total > 0 ? (g_copy_done * 100 / g_copy_total) : 0;
+    ksnprintf(label, sizeof label, " %3d%% (%d/%d) ", pct, g_copy_done, g_copy_total);
+    int len = (int)strlen(label);
+    int lcol = g_bar_col + (g_bar_w - len) / 2;
+    for (int i = 0; i < len; i++) {
+        vga_put_cell(g_bar_row, lcol + i, label[i], TUI_TITLE_FG, TUI_BG);
+    }
+}
+
 static int copy_progress_cb(const char *name, int bytes) {
     g_copy_done++;
     if (bytes >= 0) {
@@ -464,6 +626,7 @@ static int copy_progress_cb(const char *name, int bytes) {
         log_line("  [%2d/%2d] %-12s  ** FEHLER **",
                  g_copy_done, g_copy_total, name);
     }
+    draw_progress_bar();
     return 0;
 }
 
@@ -486,14 +649,22 @@ static void draw_install_progress(int target, char target_letter) {
     title_bar();
     status_keys("  Setup laeuft -- bitte nicht abschalten                                      ");
 
-    int w = 70, h = 18;
+    int w = 70, h = 17;
     int r = 3, c = (VGA_COLS - w) / 2;
     tui_dbl_box(r, c, w, h);
     char hdr[64];
-    ksnprintf(hdr, sizeof hdr, " Schritt 2/4: Installation auf %s (%c:) ",
+    ksnprintf(hdr, sizeof hdr, " Installation auf %s (%c:) ",
               disk_get(target)->name, target_letter);
     vga_write(r + 1, c + 2, hdr, TUI_TITLE_FG, TUI_BG);
     log_init(r + 3, c + 3, w - 6);
+
+    /* Progress bar lives below the log box. */
+    g_bar_row    = r + h + 1;
+    g_bar_col    = c + 1;
+    g_bar_w      = w - 2;
+    g_bar_active = 1;
+    vga_write(g_bar_row - 1, c + 1, " Fortschritt:", TUI_FG, TUI_BG);
+    draw_progress_bar();
 }
 
 int install_main(int argc, char **argv) {
@@ -509,8 +680,19 @@ int install_main(int argc, char **argv) {
     }
 
     /* Pick target */
-    int target = pick_target_disk();
-    if (target < 0) { tui_end(); return -1; }
+    int target;
+    for (;;) {
+        target = pick_target_disk();
+        if (target < 0) { tui_end(); return -1; }
+        /* Refuse a raw disk that already has an MBR -- formatting it
+         * would clobber the partition table. Loop back so the user can
+         * pick a partition instead. */
+        if (target < PART_SLOT_BASE && mbr_has_table(target)) {
+            tui_alert("Disk hat Partitionen. Bitte eine Partition auswaehlen.");
+            continue;
+        }
+        break;
+    }
 
     /* Skip targets that are install media */
     for (char L = 'A'; L < 'A' + FS_DRIVE_MAX; L++) {
@@ -520,10 +702,19 @@ int install_main(int argc, char **argv) {
         }
     }
 
-    char msg[80];
-    ksnprintf(msg, sizeof msg,
-              "Datentraeger %d (%s) wird komplett geloescht. Fortfahren?",
-              target, disk_get(target)->name);
+    char msg[120];
+    if (target >= PART_SLOT_BASE) {
+        int raw, part; u32 sectors;
+        mbr_view_info(target, &raw, &part, NULL, &sectors, NULL, NULL);
+        struct disk *parent = disk_get(raw);
+        ksnprintf(msg, sizeof msg,
+                  "Partition %s%d (%u MiB) wird formatiert. Fortfahren?",
+                  parent ? parent->name : "?", part + 1, sectors / 2048);
+    } else {
+        ksnprintf(msg, sizeof msg,
+                  "Datentraeger %d (%s, %u MiB) wird komplett geloescht. Fortfahren?",
+                  target, disk_get(target)->name, disk_get(target)->sectors / 2048);
+    }
     if (!tui_confirm(msg)) { tui_end(); kputs("\nsetup: abgebrochen\n"); return -1; }
 
     /* Determine letter to mount target on. */
@@ -626,9 +817,12 @@ int install_main(int argc, char **argv) {
     g_copy_done  = 0;
     g_copy_fail  = 0;
     g_copy_bytes = 0;
+    /* +1 reserves a progress unit for the bootloader install. */
     g_copy_total = (sys_src  != '?' ? count_dir_files(sys_src,  "SYSTEM")  : 0)
                  + (boot_src != '?' ? count_dir_files(boot_src, "BOOT")    : 0)
-                 + (smpl_src != '?' ? count_dir_files(smpl_src, "SAMPLES") : 0);
+                 + (smpl_src != '?' ? count_dir_files(smpl_src, "SAMPLES") : 0)
+                 + 1;
+    draw_progress_bar();
 
     if (sys_src != '?') {
         log_line("Kopiere \\SYSTEM\\ ...");
@@ -654,6 +848,8 @@ int install_main(int argc, char **argv) {
     } else {
         log_line("  Bootloader OK.");
     }
+    g_copy_done++;
+    draw_progress_bar();
 
     /* --- Verify the install: the three files stage1/stage2 need to find
      * at boot MUST exist on the target root, plus the system marker. */

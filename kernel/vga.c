@@ -15,6 +15,11 @@ static u32  *redir_len;
 
 /* Shadow buffer for double-buffered drawing (eliminates flicker). */
 static u16 shadow_buf[VGA_COLS * VGA_ROWS];
+/* Last-presented buffer. vga_present() only writes the cells that
+ * actually changed since the previous flush -- crucial on hypervisors
+ * like VirtualBox/VMware that poll the VGA region at their own rate
+ * and would otherwise catch a 2000-cell tight-loop copy mid-flight. */
+static u16 prev_buf[VGA_COLS * VGA_ROWS];
 static int  shadow_mode;
 
 void vga_redirect(char *buf, u32 cap, u32 *len) {
@@ -26,20 +31,50 @@ void vga_redirect(char *buf, u32 cap, u32 *len) {
 
 void vga_shadow_enable(void) {
     shadow_mode = 1;
-    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
+    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
         shadow_buf[i] = VGA_BUF[i];
+        prev_buf[i]   = shadow_buf[i];
+    }
 }
 
 void vga_shadow_flush(void) {
-    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
-        VGA_BUF[i] = shadow_buf[i];
+    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
+        VGA_BUF[i]  = shadow_buf[i];
+        prev_buf[i] = shadow_buf[i];
+    }
     shadow_mode = 0;
+}
+
+/* Spin until the VGA enters vertical retrace. Port 0x3DA bit 3 = 1
+ * during vblank. Real CRT hardware (and most VirtualBox/VMware text
+ * modes) commit framebuffer writes that land during retrace as a
+ * single visual frame -- so a present that starts in vblank is tear-
+ * and flicker-free. Bounded spins so we can't hang if the port is
+ * dead (e.g. a serial-only console). */
+static void wait_vblank(void) {
+    /* If we're already in vblank, wait for it to end first so we
+     * synchronize with the *start* of the next one. */
+    for (int i = 0; i < 200000; i++)
+        if (!(inb(0x3DA) & 0x08)) break;
+    for (int i = 0; i < 200000; i++)
+        if (inb(0x3DA) & 0x08) return;
 }
 
 void vga_present(void) {
     if (!shadow_mode) return;
-    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
-        VGA_BUF[i] = shadow_buf[i];
+    /* Sync to vertical retrace so the CRT/VM sees a single coherent
+     * frame, then do a differential update -- only cells whose value
+     * actually changed since the last flush get touched. Idle frames
+     * write 0 cells; a cursor move writes 2; even a full window drag
+     * is far below what fits in one vblank period. */
+    wait_vblank();
+    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
+        u16 s = shadow_buf[i];
+        if (s != prev_buf[i]) {
+            VGA_BUF[i] = s;
+            prev_buf[i] = s;
+        }
+    }
 }
 
 static u16 entry(char c, u8 fg, u8 bg) {
@@ -52,7 +87,96 @@ static void move_hw_cursor(void) {
     outb(0x3D4, 0x0E); outb(0x3D5, (u8)((pos >> 8) & 0xFF));
 }
 
+/* Disable VGA text-mode blink so attribute bit 7 means "bright
+ * background colour" (16 BG colours) instead of "blink foreground".
+ * BIOS defaults to blink-ON, which makes every cell with a bright
+ * background (white = 15, light cyan = 11, etc.) blink at ~2 Hz.
+ * That's the on/off/on/off "flicker" the user kept reporting -- it
+ * was the hardware doing what BIOS asked, not a rendering bug.
+ *
+ * Procedure (VGA Attribute Controller, port 0x3C0):
+ *   1. Read 0x3DA to reset the AC index/data flip-flop.
+ *   2. Write the Mode Control register index (0x10) OR'd with 0x20
+ *      so the palette stays connected to the display (otherwise the
+ *      screen goes black for one frame).
+ *   3. Read current value from 0x3C1.
+ *   4. Clear bit 3 (Enable Blink), keep everything else.
+ *   5. Write the new value back through 0x3C0.
+ */
+static void vga_disable_blink(void) {
+    inb(0x3DA);
+    outb(0x3C0, 0x10 | 0x20);
+    u8 mode = inb(0x3C1);
+    mode &= ~0x08;
+    inb(0x3DA);
+    outb(0x3C0, 0x10 | 0x20);
+    outb(0x3C0, mode);
+    inb(0x3DA);
+    outb(0x3C0, 0x20);
+}
+
+/* Overwrite a CP437 glyph in the VGA font (plane 2). VGA stores
+ * each glyph as 32 bytes -- the first 16 are the 8x16 bitmap, the
+ * rest are padding. Procedure: switch the sequencer + GFX controller
+ * to expose plane 2 at 0xA0000, write the bitmap at glyph*32,
+ * restore the original plane configuration so text mode keeps
+ * working. We only edit a single glyph at a time, so this is safe
+ * to call repeatedly. */
+void vga_set_glyph(u8 code, const u8 bitmap[16]) {
+    /* Save current state of the registers we touch. */
+    outb(0x3C4, 0x02); u8 seq_map     = inb(0x3C5);
+    outb(0x3C4, 0x04); u8 seq_mode    = inb(0x3C5);
+    outb(0x3CE, 0x04); u8 gfx_read    = inb(0x3CF);
+    outb(0x3CE, 0x05); u8 gfx_mode    = inb(0x3CF);
+    outb(0x3CE, 0x06); u8 gfx_misc    = inb(0x3CF);
+
+    /* Map plane 2 (font plane) at 0xA0000 for read+write, no
+     * odd/even chaining, no chain-4. */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x04); /* write to plane 2 only */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x07); /* extended memory, no o/e */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x02); /* read from plane 2 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x00); /* write-mode 0, no o/e */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04); /* 0xA0000-0xAFFFF, no o/e */
+
+    volatile u8 *font = (volatile u8 *)0xA0000;
+    for (int i = 0; i < 16; i++) font[(u32)code * 32 + i] = bitmap[i];
+
+    /* Restore. */
+    outb(0x3C4, 0x02); outb(0x3C5, seq_map);
+    outb(0x3C4, 0x04); outb(0x3C5, seq_mode);
+    outb(0x3CE, 0x04); outb(0x3CF, gfx_read);
+    outb(0x3CE, 0x05); outb(0x3CF, gfx_mode);
+    outb(0x3CE, 0x06); outb(0x3CF, gfx_misc);
+}
+
+/* Install a Mac-/Windows-style arrow pointer at CP437 slot 0x01
+ * (originally a smiley). The desktop's cursor renderer picks this
+ * glyph when the "Arrow" cursor style is selected. */
+static void install_arrow_glyph(void) {
+    static const u8 arrow[16] = {
+        0x80, /* #....... */
+        0xC0, /* ##...... */
+        0xA0, /* #.#..... */
+        0x90, /* #..#.... */
+        0x88, /* #...#... */
+        0x84, /* #....#.. */
+        0x82, /* #.....#. */
+        0x81, /* #......# */
+        0x82, /* #.....#. */
+        0x86, /* #....##. */
+        0x8A, /* #...#.#. */
+        0xC8, /* ##..#... */
+        0x44, /* .#...#.. */
+        0x04, /* .....#.. */
+        0x02, /* ......#. */
+        0x02, /* ......#. */
+    };
+    vga_set_glyph(0x01, arrow);
+}
+
 void vga_init(void) {
+    vga_disable_blink();
+    install_arrow_glyph();
     vga_clear();
 }
 

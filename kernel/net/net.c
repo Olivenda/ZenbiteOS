@@ -726,11 +726,21 @@ ip4_addr_t dns_server;
 void net_set_dns(ip4_addr_t s) { dns_server = s; }
 
 /* --- http_get ------------------------------------------------------- */
-/* Parse "http://HOST[:port]/path" and stream the response body to
- * the named local file. HOST can be a dotted-quad or a name; we
- * resolve via dns_resolve. Returns total body bytes on success, -1 on
- * failure. No HTTPS, no redirects, no chunked encoding. */
-int http_get(const char *url, const char *out_path) {
+/* Last-fetch status, exposed via http_last_status() so callers (e.g.
+ * the Web widget) can render meaningful errors instead of a silent
+ * empty body. Status is the HTTP response code (200, 404, 301, ...);
+ * 0 means we never got a status line; -1 means transport failure. */
+static int g_http_status;
+static char g_http_location[256];
+int http_last_status(void) { return g_http_status; }
+const char *http_last_location(void) { return g_http_location; }
+
+/* Internal: one HTTP request, no redirect-following. Parses the
+ * status line and the Location header into g_http_status /
+ * g_http_location, streams body bytes to the named file. */
+static int http_get_once(const char *url, const char *out_path) {
+    g_http_status = 0;
+    g_http_location[0] = '\0';
     if (strncmp(url, "http://", 7) != 0) {
         kputs("http_get: only http:// supported\n");
         return -1;
@@ -760,12 +770,11 @@ int http_get(const char *url, const char *out_path) {
     char req[256];
     int reqlen = ksnprintf(req, sizeof req,
                            "GET %s HTTP/1.0\r\nHost: %s\r\n"
-                           "User-Agent: Zenbite/0.2\r\n"
+                           "User-Agent: Zenbite/0.3\r\n"
                            "Connection: close\r\n\r\n",
                            path, host);
     tcp_send(req, (u32)reqlen);
 
-    /* Read response: skip headers (up to \r\n\r\n), then stream body. */
     fs_unlink(out_path);
     if (fs_create(out_path) < 0) {
         kputs("http_get: cannot create output file\n");
@@ -774,38 +783,96 @@ int http_get(const char *url, const char *out_path) {
     int fh = fs_open(out_path);
     if (fh < 0) { tcp_close(); return -1; }
 
+    /* Header parser: accumulate into a small line buffer so we can
+     * extract the status line and Location:. State machine: every
+     * \r\n closes a "line"; the special blank line (CRLF CRLF)
+     * marks the body start. */
+    char line[256]; int ll = 0;
     int header_done = 0;
-    int match = 0;            /* state for matching \r\n\r\n */
+    int got_status = 0;
     static u8 chunk[1024];
     u32 total = 0;
     for (;;) {
         int n = tcp_recv(chunk, sizeof chunk, 500);
         if (n <= 0) break;
-        u32 start = 0;
-        if (!header_done) {
-            for (int i = 0; i < n; i++) {
-                u8 c = chunk[i];
-                if ((match == 0 && c == '\r') ||
-                    (match == 1 && c == '\n') ||
-                    (match == 2 && c == '\r') ||
-                    (match == 3 && c == '\n')) {
-                    match++;
-                } else {
-                    match = (c == '\r') ? 1 : 0;
-                }
-                if (match == 4) {
-                    header_done = 1;
-                    start = (u32)(i + 1);
-                    break;
-                }
+        int i = 0;
+        while (!header_done && i < n) {
+            u8 c = chunk[i++];
+            if (c == '\r') continue;
+            if (c != '\n') {
+                if (ll < (int)sizeof line - 1) line[ll++] = (char)c;
+                continue;
             }
+            /* End of one header line. */
+            line[ll] = '\0';
+            if (ll == 0) { header_done = 1; break; }
+            if (!got_status &&
+                line[0] == 'H' && line[1] == 'T' && line[2] == 'T' &&
+                line[3] == 'P' && line[4] == '/') {
+                /* "HTTP/1.0 200 OK" -- find first space. */
+                int j = 0; while (line[j] && line[j] != ' ') j++;
+                while (line[j] == ' ') j++;
+                int code = 0;
+                while (line[j] >= '0' && line[j] <= '9') {
+                    code = code * 10 + (line[j] - '0'); j++;
+                }
+                g_http_status = code;
+                got_status = 1;
+            } else if ((line[0] == 'L' || line[0] == 'l') &&
+                       (line[1] == 'o' || line[1] == 'O') &&
+                       strncmp(line + 2, "cation:", 7) == 0) {
+                int j = 9;
+                while (line[j] == ' ' || line[j] == '\t') j++;
+                int o = 0;
+                while (line[j] && o < (int)sizeof g_http_location - 1)
+                    g_http_location[o++] = line[j++];
+                g_http_location[o] = '\0';
+            }
+            ll = 0;
         }
-        if (header_done && start < (u32)n) {
-            int w = fs_write(fh, chunk + start, (size_t)((u32)n - start));
+        if (header_done && i < n) {
+            int w = fs_write(fh, chunk + i, (size_t)(n - i));
             if (w > 0) total += (u32)w;
         }
     }
     fs_close(fh);
     tcp_close();
     return (int)total;
+}
+
+/* Public http_get: follow 301/302/303/307/308 redirects up to 5
+ * times. Useful because many old-web sites redirect their root to a
+ * canonical path -- and Google redirects http -> https almost
+ * immediately, so this lets the caller see "301" + the destination
+ * instead of an empty body. */
+int http_get(const char *url, const char *out_path) {
+    char cur[512];
+    int  cl = 0;
+    while (cl < (int)sizeof cur - 1 && url[cl]) { cur[cl] = url[cl]; cl++; }
+    cur[cl] = '\0';
+    for (int hop = 0; hop < 5; hop++) {
+        int body = http_get_once(cur, out_path);
+        int st = g_http_status;
+        if (st == 301 || st == 302 || st == 303 ||
+            st == 307 || st == 308) {
+            if (!g_http_location[0]) return body;
+            /* Absolute URL?  Use as-is.  Otherwise glue onto current
+             * scheme/host (we only do http://, so absolute is the
+             * common case from real servers). */
+            if (strncmp(g_http_location, "http://", 7) == 0) {
+                int i = 0;
+                while (g_http_location[i] && i < (int)sizeof cur - 1) {
+                    cur[i] = g_http_location[i]; i++;
+                }
+                cur[i] = '\0';
+                continue;
+            }
+            /* HTTPS or other-scheme redirect: we can't follow. Leave
+             * body as the redirect page (typically a tiny "Moved"
+             * notice) so the caller can show the target URL. */
+            return body;
+        }
+        return body;
+    }
+    return -1;
 }

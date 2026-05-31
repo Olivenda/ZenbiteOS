@@ -49,6 +49,8 @@ void  kfree(void *p);
 /* Keyboard. */
 int  kb_getc(void);            /* blocking */
 int  kb_trygetc(void);         /* -1 if none */
+int  kb_intr_pending(void);    /* Ctrl+C pressed since last consume? */
+void kb_intr_consume(void);    /* clear the Ctrl+C latch */
 void        kb_set_layout(const char *name);    /* "us" / "de" */
 const char *kb_get_layout(void);
 
@@ -72,6 +74,14 @@ void mouse_set_bounds(int cols, int rows);
 #define KB_F3    0x92
 #define KB_F4    0x93
 #define KB_F5    0x94
+#define KB_F6    0x95
+#define KB_F7    0x96
+#define KB_F8    0x97
+
+/* Clipboard (cross-app shared text buffer). */
+void clipboard_set(const char *buf, int n);
+int  clipboard_get(char *out, int max);
+int  clipboard_len(void);
 
 /* CMOS RTC. */
 struct rtc_time {
@@ -80,6 +90,7 @@ struct rtc_time {
     u16 year;
 };
 void rtc_read(struct rtc_time *t);
+void rtc_write(const struct rtc_time *t);
 
 /* Panic. */
 __attribute__((noreturn)) void panic(const char *fmt, ...);

@@ -849,6 +849,53 @@ static int handle_normal(int c) {
     case '?': do_search(-1); break;
     case 'n': if (search_pat[0]) { search_next(); redraw_screen(); } break;
 
+    /* clipboard: yy copies current line, Y copies to EOL, p pastes
+     * after current line. Lines are stored newline-terminated in the
+     * clipboard so other apps (Notes, shell input) get sensible
+     * line boundaries when receiving editor copies. */
+    case 'y': {
+        int c2 = kb_getc();
+        if (c2 == 'y' && line_count > 0) {
+            char buf[MAX_LINE + 2];
+            int n = (int)strlen(lines[cur_row]);
+            for (int i = 0; i < n; i++) buf[i] = lines[cur_row][i];
+            buf[n++] = '\n';
+            clipboard_set(buf, n);
+            set_msg("yanked 1 line to clipboard");
+        }
+        break;
+    }
+    case 'Y':
+        if (line_count > 0) {
+            const char *L = lines[cur_row];
+            int len = (int)strlen(L), from = cur_col > len ? len : cur_col;
+            clipboard_set(L + from, len - from);
+            set_msg("yanked to clipboard");
+        }
+        break;
+    case 'p':
+        if (clipboard_len() > 0) {
+            char buf[MAX_LINE + 2];
+            int n = clipboard_get(buf, MAX_LINE);
+            /* Strip trailing newline so paste-as-line doesn't drop a blank. */
+            if (n > 0 && buf[n - 1] == '\n') n--;
+            buf[n] = '\0';
+            int ins_row = cur_row + 1;
+            if (line_count < MAX_LINES) {
+                for (int i = line_count; i > ins_row; i--)
+                    memcpy(lines[i], lines[i - 1], MAX_LINE);
+                for (int i = 0; i < n && i < MAX_LINE - 1; i++)
+                    lines[ins_row][i] = buf[i];
+                lines[ins_row][n < MAX_LINE - 1 ? n : MAX_LINE - 1] = '\0';
+                line_count++;
+                cur_row = ins_row; cur_col = 0;
+                ensure_visible();
+                dirty = 1;
+                redraw_screen();
+            }
+        }
+        break;
+
     /* misc */
     case '\n': case '\r': move_down(); break;
     }

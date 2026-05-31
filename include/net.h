@@ -74,5 +74,7 @@ void       net_set_dns(ip4_addr_t server);
 
 /* HTTP --------------------------------------------------------------- */
 int  http_get(const char *url, const char *out_path);
+int  http_last_status(void);              /* HTTP status of last fetch */
+const char *http_last_location(void);     /* Location: of last fetch (3xx) */
 
 #endif
